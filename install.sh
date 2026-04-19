@@ -18,6 +18,10 @@ mkdir -p /etc/cloudsync/secrets
 chmod 0750 /etc/cloudsync
 chmod 0700 /etc/cloudsync/secrets
 
+echo "==> Creating /var/lib/cloudsync (state dir: last-run / last-success / attempts)"
+mkdir -p /var/lib/cloudsync
+chmod 0750 /var/lib/cloudsync
+
 if [ ! -f /etc/cloudsync/mappings.yaml ]; then
     echo "==> Installing example mappings.yaml"
     install -m 0640 "$SRC_DIR/examples/mappings.yaml" /etc/cloudsync/mappings.yaml

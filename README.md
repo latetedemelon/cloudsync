@@ -255,6 +255,25 @@ Run everything (useful from a manual cron or for catch-up):
 sudo cloudsync run-all
 ```
 
+Check health of all mappings at a glance:
+
+```bash
+sudo cloudsync status
+```
+
+Example output:
+
+```
+ID          MODE    TRIGGER    LAST_SUCCESS  LAST_RUN   NEXT_FIRE   STATE
+documents   sync    both       2h ago        2h ago     in 45m      ok
+photos      backup  scheduled  17h ago       17h ago    in 7h       ok
+code        sync    realtime   30m ago       2m ago     realtime    FAILING
+    last-error: CalledProcessError: command [...] exited 5  (consecutive attempts: 3)
+```
+
+Exit code is `0` if every mapping's most recent run succeeded, `1`
+otherwise — handy for monitoring probes.
+
 List restic snapshots for a backup mapping (substitute the `destination:`
 and `password_file:` values from your mapping):
 
@@ -271,6 +290,82 @@ RCLONE_CONFIG=/etc/cloudsync/rclone.conf \
 RESTIC_PASSWORD_FILE=/etc/cloudsync/secrets/<id>.pass \
   restic -r rclone:<remote>:<path> restore latest --target /tmp/restore
 ```
+
+## Resilience and recovery
+
+**What happens when things break?** cloudsync's recovery model leans on
+the idempotent tools underneath plus a few safety nets:
+
+- **Automatic catch-up.** Both `rclone sync` and `restic` are
+  convergent: every run re-scans and only transfers the diff. A run
+  interrupted by a network drop leaves the repo valid; the next run
+  picks up where it left off.
+- **Retry-with-backoff on every run.** If a run fails, `cloudsync run`
+  waits (defaults: 60s, then 5m, then 30m) and retries up to three
+  times before exiting non-zero and firing `OnFailure=`. Configurable
+  per mapping via `retry.max_attempts` and `retry.backoff_seconds`.
+- **Persistent missed triggers.** Timers use `Persistent=true`: if the
+  machine is off/asleep when a scheduled fire would have happened, it
+  runs on next boot.
+- **Realtime re-arming on failure.** If a realtime-triggered run fails
+  all retries, the tick script re-sets the dirty flag so the next file
+  change (or scheduled safety-net run) picks up the pending work.
+- **Scheduled safety net.** For realtime mappings, `trigger: both`
+  pairs the path unit with a scheduled timer so outages bounded by the
+  timer period can't strand work indefinitely.
+- **State tracking.** `/var/lib/cloudsync/<id>.{last-run,last-success,
+  last-error,attempts}` is updated atomically on each run. `cloudsync
+  status` reads these.
+
+### Monitoring remote integrity
+
+The convergent-run model catches transfer failures, but not **silent
+remote corruption** (bitrot, accidental deletion on the remote,
+provider-side data loss). For that, run periodic integrity checks:
+
+```bash
+sudo cloudsync check-remote             # all mappings
+sudo cloudsync check-remote photos      # one mapping
+```
+
+- For `mode: backup`: runs `restic check` against the repository —
+  verifies pack file structure, snapshot references, and index
+  consistency. Add `--read-data` via `systemctl edit` for periodic
+  full-content verification (reads every byte; expensive).
+- For `mode: sync`: runs `rclone check --size-only` between source and
+  destination — flags missing, extra, or size-mismatched files. Drop
+  `--size-only` for a full-checksum check where the backend supports
+  it (see rclone's per-backend notes on hash availability).
+
+Schedule a weekly integrity run with a transient systemd timer, or via
+`systemctl edit` on a small wrapper — the exact timer is your call.
+Example `/etc/systemd/system/cloudsync-check.timer`:
+
+```ini
+[Unit]
+Description=Weekly cloudsync remote integrity check
+
+[Timer]
+OnCalendar=Sun 04:00
+Persistent=true
+Unit=cloudsync-check.service
+
+[Install]
+WantedBy=timers.target
+```
+
+With a matching `cloudsync-check.service`:
+
+```ini
+[Unit]
+Description=Cloudsync remote integrity check (all mappings)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/cloudsync check-remote
+```
+
+Then `systemctl enable --now cloudsync-check.timer`.
 
 ## Adding, changing, or removing mappings
 

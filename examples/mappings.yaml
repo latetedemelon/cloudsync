@@ -10,6 +10,8 @@
 #   debounce  = seconds to wait after a change before syncing (realtime only)
 #   timeout   = systemd TimeoutStartSec value (default: 6h)
 #   retention.prune = "always" (default) | "never"  (backup mode only)
+#   retry.max_attempts      = attempts per run (default: 3)
+#   retry.backoff_seconds   = delays between attempts (default: [60, 300, 1800])
 #
 # Destination syntax is always rclone-style: <remote>:<path>
 # `<remote>` is a name you defined with `rclone config`; the backend can be
@@ -60,12 +62,17 @@ mappings:
       prune: always   # run `restic forget --prune` on every backup
 
   # --- SYNC, realtime only, to an offsite server (e.g. SFTP/WebDAV remote) ---
+  # Tighter retry schedule: realtime edits should re-try quickly, and
+  # we don't want to hold the tick lock for 30 minutes on failure.
   - id: code
     source: /home/rob/code
     destination: offsite:/backups/code
     mode: sync
     trigger: realtime
     debounce: 45
+    retry:
+      max_attempts: 3
+      backoff_seconds: [30, 120, 300]  # 30s, 2m, 5m
     exclude:
       - "node_modules/"
       - ".venv/"

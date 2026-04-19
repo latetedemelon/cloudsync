@@ -37,7 +37,14 @@ fi
 sleep "$debounce"
 
 # Drain: run until no new dirty marks arrive during a run.
+# On failure, re-mark the flag so the next trigger (file change, manual
+# invocation, or scheduled safety-net run) picks up the still-dirty
+# mapping. cloudsync run does its own retry-with-backoff internally, so
+# by the time this exits non-zero we've already retried for a while.
 while [ -f "$flag" ]; do
     rm -f "$flag"
-    /usr/local/bin/cloudsync run "$id"
+    if ! /usr/local/bin/cloudsync run "$id"; then
+        touch "$flag"
+        exit 1
+    fi
 done

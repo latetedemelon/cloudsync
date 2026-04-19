@@ -6,6 +6,7 @@ Run: python3 -m pytest tests/
 from __future__ import annotations
 
 import importlib.util
+import subprocess
 import sys
 import textwrap
 import unittest
@@ -169,6 +170,133 @@ class TemplateRenderTests(unittest.TestCase):
         )
         self.assertIn("OnCalendar=hourly", rendered)
         self.assertIn("Unit=cloudsync-docs.service", rendered)
+
+
+class RetryConfigTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_default_retry(self):
+        p = _write(self.tmp, """\
+            mappings:
+              - id: docs
+                source: /srv/x
+                destination: r:x
+                mode: sync
+        """)
+        _, mappings = cloudsync.load_config(p)
+        m = mappings[0]
+        self.assertEqual(m.retry.max_attempts, 3)
+        self.assertEqual(m.retry.backoff_seconds, [60, 300, 1800])
+
+    def test_per_mapping_retry(self):
+        p = _write(self.tmp, """\
+            mappings:
+              - id: docs
+                source: /srv/x
+                destination: r:x
+                mode: sync
+                retry:
+                  max_attempts: 5
+                  backoff_seconds: [10, 20, 40, 80, 160]
+        """)
+        _, mappings = cloudsync.load_config(p)
+        m = mappings[0]
+        self.assertEqual(m.retry.max_attempts, 5)
+        self.assertEqual(m.retry.backoff_seconds, [10, 20, 40, 80, 160])
+
+    def test_rejects_bad_retry_keys(self):
+        p = _write(self.tmp, """\
+            mappings:
+              - id: docs
+                source: /srv/x
+                destination: r:x
+                mode: sync
+                retry:
+                  attempts: 5
+        """)
+        with self.assertRaises(cloudsync.ConfigError):
+            cloudsync.load_config(p)
+
+    def test_rejects_zero_attempts(self):
+        p = _write(self.tmp, """\
+            mappings:
+              - id: docs
+                source: /srv/x
+                destination: r:x
+                mode: sync
+                retry:
+                  max_attempts: 0
+        """)
+        with self.assertRaises(cloudsync.ConfigError):
+            cloudsync.load_config(p)
+
+
+class RetryLoopTests(unittest.TestCase):
+    def _mapping(self, max_attempts=3, backoff=(0, 0, 0)):
+        return cloudsync.Mapping(
+            id="t", source=Path("/x"), destination="r:x", mode="sync",
+            retry=cloudsync.Retry(
+                max_attempts=max_attempts, backoff_seconds=list(backoff)
+            ),
+        )
+
+    def test_retry_succeeds_after_transient_failure(self):
+        attempts = {"n": 0}
+        def fn():
+            attempts["n"] += 1
+            if attempts["n"] < 3:
+                raise subprocess.CalledProcessError(1, ["cmd"])
+        cloudsync._retry(self._mapping(), fn)
+        self.assertEqual(attempts["n"], 3)
+
+    def test_retry_gives_up_and_raises(self):
+        attempts = {"n": 0}
+        def fn():
+            attempts["n"] += 1
+            raise subprocess.CalledProcessError(2, ["cmd"])
+        with self.assertRaises(subprocess.CalledProcessError):
+            cloudsync._retry(self._mapping(), fn)
+        self.assertEqual(attempts["n"], 3)
+
+    def test_retry_single_attempt_no_backoff(self):
+        attempts = {"n": 0}
+        def fn():
+            attempts["n"] += 1
+            raise subprocess.CalledProcessError(2, ["cmd"])
+        with self.assertRaises(subprocess.CalledProcessError):
+            cloudsync._retry(self._mapping(max_attempts=1), fn)
+        self.assertEqual(attempts["n"], 1)
+
+
+class StateTrackingTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig_state_dir = cloudsync.STATE_DIR
+        cloudsync.STATE_DIR = Path(self._tmp.name)
+
+    def tearDown(self):
+        cloudsync.STATE_DIR = self._orig_state_dir
+        self._tmp.cleanup()
+
+    def test_mark_success_clears_error(self):
+        cloudsync._mark_run_failure("m1", "boom", attempt=2)
+        self.assertIsNotNone(cloudsync._read_state("m1", "last-error"))
+        self.assertEqual(cloudsync._read_state("m1", "attempts"), "2")
+        cloudsync._mark_run_success("m1")
+        self.assertIsNone(cloudsync._read_state("m1", "last-error"))
+        self.assertIsNone(cloudsync._read_state("m1", "attempts"))
+        self.assertIsNotNone(cloudsync._read_state("m1", "last-success"))
+
+    def test_mark_run_start(self):
+        cloudsync._mark_run_start("m1")
+        self.assertIsNotNone(cloudsync._read_state("m1", "last-run"))
 
 
 class ExpectedUnitsTests(unittest.TestCase):

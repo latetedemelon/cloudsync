@@ -6,10 +6,12 @@ Reads /etc/cloudsync/mappings.yaml, dispatches each entry to either
 `rclone sync` (mirror) or `restic` (versioned, deduplicated, encrypted).
 
 Subcommands:
-  run <id>         Run one mapping by id
+  run <id>         Run one mapping by id (with retry-on-failure)
   run-all          Run all mappings sequentially
   list             List configured mappings
   check            Validate config and sources
+  status           Report last-run / last-success / next-fire for each mapping
+  check-remote     Verify remote integrity (restic check / rclone check)
   setup-systemd    Generate per-mapping systemd service/timer/path units
 """
 
@@ -25,7 +27,9 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -36,15 +40,19 @@ except ImportError:
     sys.exit(1)
 
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 CONFIG_PATH = Path(os.environ.get("CLOUDSYNC_CONFIG", "/etc/cloudsync/mappings.yaml"))
 RCLONE_CONFIG = Path(os.environ.get("RCLONE_CONFIG", "/etc/cloudsync/rclone.conf"))
 SYSTEMD_DIR = Path("/etc/systemd/system")
 RUNTIME_DIR = Path("/run/cloudsync")
+STATE_DIR = Path(os.environ.get("CLOUDSYNC_STATE_DIR", "/var/lib/cloudsync"))
 
 # Restic exit code for "repository does not exist".
 RESTIC_EXIT_REPO_MISSING = 10
+
+# Default retry schedule for transient failures (seconds).
+DEFAULT_RETRY_BACKOFF = [60, 300, 1800]  # 1m, 5m, 30m
 
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
@@ -64,6 +72,12 @@ class Retention:
 
 
 @dataclass
+class Retry:
+    max_attempts: int = 3
+    backoff_seconds: list[int] = field(default_factory=lambda: list(DEFAULT_RETRY_BACKOFF))
+
+
+@dataclass
 class Mapping:
     id: str
     source: Path
@@ -75,6 +89,7 @@ class Mapping:
     timeout: str = "6h"  # systemd TimeoutStartSec value
     password_file: Optional[Path] = None
     retention: Retention = field(default_factory=Retention)
+    retry: Retry = field(default_factory=Retry)
     rclone_flags: list[str] = field(default_factory=list)
     exclude: list[str] = field(default_factory=list)
 
@@ -128,6 +143,25 @@ def _build_mapping(entry: dict) -> Mapping:
         )
     retention = Retention(**retention_raw)
 
+    retry_raw = entry.get("retry") or {}
+    if not isinstance(retry_raw, dict):
+        raise ConfigError(f"mapping {mid!r}: retry must be a mapping")
+    allowed_retry = {f for f in Retry.__dataclass_fields__}
+    unknown_retry = set(retry_raw) - allowed_retry
+    if unknown_retry:
+        raise ConfigError(
+            f"mapping {mid!r}: unknown retry keys: {sorted(unknown_retry)}"
+        )
+    max_attempts = int(retry_raw.get("max_attempts", 3))
+    if max_attempts < 1:
+        raise ConfigError(f"mapping {mid!r}: retry.max_attempts must be >= 1")
+    backoff = retry_raw.get("backoff_seconds", list(DEFAULT_RETRY_BACKOFF))
+    if not isinstance(backoff, list) or not all(isinstance(x, int) and x >= 0 for x in backoff):
+        raise ConfigError(
+            f"mapping {mid!r}: retry.backoff_seconds must be a list of non-negative ints"
+        )
+    retry = Retry(max_attempts=max_attempts, backoff_seconds=list(backoff))
+
     return Mapping(
         id=mid,
         source=Path(source),
@@ -139,6 +173,7 @@ def _build_mapping(entry: dict) -> Mapping:
         timeout=timeout,
         password_file=Path(entry["password_file"]) if entry.get("password_file") else None,
         retention=retention,
+        retry=retry,
         rclone_flags=list(entry.get("rclone_flags", []) or []),
         exclude=list(entry.get("exclude", []) or []),
     )
@@ -179,6 +214,98 @@ def _acquire_run_lock(mapping_id: str):
         fh.close()
         return None
     return fh
+
+
+# ---------- state tracking ----------
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _state_path(mapping_id: str, suffix: str) -> Path:
+    return STATE_DIR / f"{mapping_id}.{suffix}"
+
+
+def _write_state(mapping_id: str, suffix: str, content: str) -> None:
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+    except PermissionError:
+        return  # no-op if state dir is inaccessible (e.g. non-root test run)
+    path = _state_path(mapping_id, suffix)
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", dir=str(STATE_DIR), prefix=f".{path.name}.", delete=False,
+        ) as tmp:
+            tmp.write(content)
+            tmp_path = Path(tmp.name)
+        os.replace(tmp_path, path)
+    except OSError as e:
+        log.warning("could not write state %s: %s", path, e)
+
+
+def _read_state(mapping_id: str, suffix: str) -> Optional[str]:
+    path = _state_path(mapping_id, suffix)
+    try:
+        return path.read_text().strip() or None
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return None
+
+
+def _clear_state(mapping_id: str, suffix: str) -> None:
+    try:
+        _state_path(mapping_id, suffix).unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+
+def _mark_run_start(mapping_id: str) -> None:
+    _write_state(mapping_id, "last-run", _now_iso() + "\n")
+
+
+def _mark_run_success(mapping_id: str) -> None:
+    _write_state(mapping_id, "last-success", _now_iso() + "\n")
+    _clear_state(mapping_id, "last-error")
+    _clear_state(mapping_id, "attempts")
+
+
+def _mark_run_failure(mapping_id: str, err: str, attempt: int) -> None:
+    _write_state(mapping_id, "last-error", f"{_now_iso()}\n{err}\n")
+    _write_state(mapping_id, "attempts", f"{attempt}\n")
+
+
+# ---------- retry loop ----------
+
+def _retry(m: Mapping, fn) -> None:
+    """Run fn() with retry-on-failure using m.retry config.
+
+    Re-raises the last exception if all attempts fail.
+    """
+    last_exc: Optional[BaseException] = None
+    for attempt in range(1, m.retry.max_attempts + 1):
+        try:
+            fn()
+            return
+        except subprocess.CalledProcessError as e:
+            last_exc = e
+            err = f"{e.__class__.__name__}: command {e.cmd!r} exited {e.returncode}"
+            _mark_run_failure(m.id, err, attempt)
+            if attempt >= m.retry.max_attempts:
+                break
+            # Pick backoff: index into list, clamp to last value.
+            idx = min(attempt - 1, len(m.retry.backoff_seconds) - 1)
+            wait = m.retry.backoff_seconds[idx] if m.retry.backoff_seconds else 0
+            log.warning(
+                "mapping %s: attempt %d/%d failed (exit %d); retrying in %ds",
+                m.id, attempt, m.retry.max_attempts, e.returncode, wait,
+            )
+            if wait > 0:
+                time.sleep(wait)
+    assert last_exc is not None
+    raise last_exc
 
 
 # ---------- execution ----------
@@ -266,7 +393,9 @@ def _run_locked(m: Mapping) -> None:
     if lock is None:
         return
     try:
-        dispatch(m)
+        _mark_run_start(m.id)
+        _retry(m, lambda: dispatch(m))
+        _mark_run_success(m.id)
     finally:
         lock.close()
 
@@ -314,6 +443,189 @@ def cmd_list(args) -> None:
     print("-" * 80)
     for m in mappings:
         print(f"{m.id.ljust(w_id)}  {m.mode:<6}  {m.trigger:<9}  {m.source} -> {m.destination}")
+
+
+# ---------- status ----------
+
+def _parse_iso(s: Optional[str]) -> Optional[datetime]:
+    if not s:
+        return None
+    s = s.splitlines()[0].strip()
+    try:
+        return datetime.fromisoformat(s)
+    except ValueError:
+        return None
+
+
+def _humanize(ts: Optional[datetime], now: datetime) -> str:
+    if ts is None:
+        return "never"
+    delta = now - ts
+    secs = int(delta.total_seconds())
+    if secs < 0:
+        secs = -secs
+        suffix = "from now"
+    else:
+        suffix = "ago"
+    if secs < 60:
+        return f"{secs}s {suffix}"
+    if secs < 3600:
+        return f"{secs // 60}m {suffix}"
+    if secs < 86400:
+        return f"{secs // 3600}h {suffix}"
+    return f"{secs // 86400}d {suffix}"
+
+
+def _systemd_next_fire(unit: str) -> Optional[datetime]:
+    if not shutil.which("systemctl"):
+        return None
+    res = subprocess.run(
+        ["systemctl", "show", unit,
+         "--property=NextElapseUSecRealtime", "--value"],
+        capture_output=True, text=True,
+    )
+    if res.returncode != 0:
+        return None
+    raw = res.stdout.strip()
+    if not raw or raw == "0" or raw == "n/a":
+        return None
+    # systemd emits a human-readable timestamp, e.g. "Sun 2026-04-19 05:30:00 UTC"
+    for fmt in ("%a %Y-%m-%d %H:%M:%S %Z", "%a %Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(raw, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
+def cmd_status(args) -> None:
+    _, mappings = load_config()
+    if not mappings:
+        print("(no mappings configured)")
+        return
+
+    now = datetime.now(timezone.utc)
+    rows = []
+    any_failing = False
+    for m in mappings:
+        last_run = _parse_iso(_read_state(m.id, "last-run"))
+        last_succ = _parse_iso(_read_state(m.id, "last-success"))
+        last_err_raw = _read_state(m.id, "last-error")
+        attempts_raw = _read_state(m.id, "attempts")
+        attempts = int(attempts_raw.strip()) if attempts_raw and attempts_raw.strip().isdigit() else 0
+
+        # A mapping is "failing" if its most recent run ended in error,
+        # i.e. last-error is present and last-success (if any) predates it.
+        last_err_ts = None
+        if last_err_raw:
+            last_err_ts = _parse_iso(last_err_raw)
+        failing = (
+            last_err_ts is not None
+            and (last_succ is None or last_err_ts > last_succ)
+        )
+        if failing:
+            any_failing = True
+
+        next_fire = None
+        if m.trigger in ("scheduled", "both"):
+            next_fire = _systemd_next_fire(f"cloudsync-{m.id}.timer")
+
+        state = "FAILING" if failing else ("ok" if last_succ else "-")
+        rows.append({
+            "id": m.id,
+            "mode": m.mode,
+            "trigger": m.trigger,
+            "last_success": _humanize(last_succ, now),
+            "last_run": _humanize(last_run, now),
+            "next_fire": _humanize(next_fire, now) if next_fire else (
+                "realtime" if m.trigger == "realtime" else "-"
+            ),
+            "state": state,
+            "attempts": attempts,
+        })
+
+    widths = {k: max(len(k), max(len(str(r[k])) for r in rows)) for k in rows[0]}
+    # Header
+    header = "  ".join(k.upper().ljust(widths[k]) for k in
+                       ("id", "mode", "trigger", "last_success", "last_run", "next_fire", "state"))
+    print(header)
+    print("-" * len(header))
+    for r in rows:
+        line = "  ".join(str(r[k]).ljust(widths[k]) for k in
+                         ("id", "mode", "trigger", "last_success", "last_run", "next_fire", "state"))
+        print(line)
+        if r["state"] == "FAILING":
+            err = _read_state(r["id"], "last-error")
+            if err:
+                # last-error file is "<iso>\n<message>\n"
+                lines = err.strip().splitlines()
+                msg = lines[1] if len(lines) > 1 else ""
+                print(f"    last-error: {msg}  (consecutive attempts: {r['attempts']})")
+
+    sys.exit(1 if any_failing else 0)
+
+
+# ---------- check-remote ----------
+
+def _check_remote_sync(m: Mapping) -> None:
+    cmd = [
+        "rclone", "check",
+        "--config", str(RCLONE_CONFIG),
+        "--size-only",  # fast: doesn't download/hash every file
+        str(m.source), m.destination,
+    ]
+    for pattern in m.exclude:
+        cmd.extend(["--exclude", pattern])
+    log.info("[check-remote sync] %s <-> %s", m.source, m.destination)
+    subprocess.run(cmd, check=True)
+
+
+def _check_remote_backup(m: Mapping) -> None:
+    if not m.password_file or not m.password_file.exists():
+        raise FileNotFoundError(f"mapping {m.id}: password file missing: {m.password_file}")
+    env = os.environ.copy()
+    env["RCLONE_CONFIG"] = str(RCLONE_CONFIG)
+    env["RESTIC_PASSWORD_FILE"] = str(m.password_file)
+    repo = f"rclone:{m.destination}"
+    log.info("[check-remote backup] %s", repo)
+    subprocess.run(["restic", "-r", repo, "check"], env=env, check=True)
+
+
+def cmd_check_remote(args) -> None:
+    _, mappings = load_config()
+    by_id = {m.id: m for m in mappings}
+    if args.id:
+        if args.id not in by_id:
+            log.error("unknown mapping id: %s", args.id)
+            log.error("available: %s", ", ".join(by_id))
+            sys.exit(2)
+        targets = [by_id[args.id]]
+    else:
+        targets = mappings
+
+    failed: list[str] = []
+    for m in targets:
+        try:
+            if m.mode == "sync":
+                _check_remote_sync(m)
+            elif m.mode == "backup":
+                _check_remote_backup(m)
+            else:
+                log.error("%s: cannot check mode %s", m.id, m.mode)
+                failed.append(m.id)
+                continue
+            log.info("%s: OK", m.id)
+        except subprocess.CalledProcessError as e:
+            log.error("%s: check failed (exit %d)", m.id, e.returncode)
+            failed.append(m.id)
+        except Exception as e:
+            log.error("%s: check error: %s", m.id, e)
+            failed.append(m.id)
+
+    print(f"\ncheck-remote summary: {len(targets) - len(failed)} ok, {len(failed)} failed")
+    if failed:
+        print(f"failed: {', '.join(failed)}")
+        sys.exit(1)
 
 
 def _validate_schedule(expr: str) -> Optional[str]:
@@ -415,7 +727,7 @@ ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
 PrivateTmp=true
-ReadWritePaths=/etc/cloudsync /run/cloudsync /root/.cache/rclone /root/.cache/restic
+ReadWritePaths=/etc/cloudsync /run/cloudsync /var/lib/cloudsync /root/.cache/rclone /root/.cache/restic
 """
 
 TIMER_TEMPLATE = """\
@@ -454,7 +766,7 @@ ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
 PrivateTmp=true
-ReadWritePaths=/etc/cloudsync /run/cloudsync /root/.cache/rclone /root/.cache/restic
+ReadWritePaths=/etc/cloudsync /run/cloudsync /var/lib/cloudsync /root/.cache/rclone /root/.cache/restic
 """
 
 REALTIME_PATH_TEMPLATE = """\
@@ -666,6 +978,17 @@ def main() -> None:
 
     sp = sub.add_parser("check", help="validate config and dependencies")
     sp.set_defaults(func=cmd_check)
+
+    sp = sub.add_parser("status", help="report last-run / last-success / next-fire per mapping")
+    sp.set_defaults(func=cmd_status)
+
+    sp = sub.add_parser(
+        "check-remote",
+        help="verify remote integrity (restic check for backup, rclone check for sync)",
+    )
+    sp.add_argument("id", nargs="?", default=None,
+                    help="mapping id to check; omit to check all")
+    sp.set_defaults(func=cmd_check_remote)
 
     sp = sub.add_parser("setup-systemd", help="generate and enable systemd units from config")
     sp.add_argument("--dry-run", action="store_true", help="print units without writing")
