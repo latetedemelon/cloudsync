@@ -16,11 +16,15 @@ Subcommands:
 from __future__ import annotations
 
 import argparse
+import fcntl
 import logging
 import os
+import re
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -32,9 +36,18 @@ except ImportError:
     sys.exit(1)
 
 
+__version__ = "0.2.0"
+
 CONFIG_PATH = Path(os.environ.get("CLOUDSYNC_CONFIG", "/etc/cloudsync/mappings.yaml"))
 RCLONE_CONFIG = Path(os.environ.get("RCLONE_CONFIG", "/etc/cloudsync/rclone.conf"))
 SYSTEMD_DIR = Path("/etc/systemd/system")
+RUNTIME_DIR = Path("/run/cloudsync")
+
+# Restic exit code for "repository does not exist".
+RESTIC_EXIT_REPO_MISSING = 10
+
+ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 log = logging.getLogger("cloudsync")
 
@@ -47,6 +60,7 @@ class Retention:
     keep_weekly: int = 4
     keep_monthly: int = 12
     keep_yearly: int = 0
+    prune: str = "always"  # "always" | "never"
 
 
 @dataclass
@@ -58,46 +72,119 @@ class Mapping:
     trigger: str = "scheduled"  # "realtime" | "scheduled" | "both"
     schedule: str = "daily"  # OnCalendar shortcut or full expression
     debounce: int = 30  # seconds for realtime debounce
+    timeout: str = "6h"  # systemd TimeoutStartSec value
     password_file: Optional[Path] = None
     retention: Retention = field(default_factory=Retention)
     rclone_flags: list[str] = field(default_factory=list)
     exclude: list[str] = field(default_factory=list)
 
 
+class ConfigError(Exception):
+    pass
+
+
+def _require_safe(value: str, field_name: str, mapping_id: str) -> None:
+    if CONTROL_CHARS_RE.search(value):
+        raise ConfigError(
+            f"mapping {mapping_id!r}: field {field_name!r} contains control characters"
+        )
+
+
+def _build_mapping(entry: dict) -> Mapping:
+    if not isinstance(entry, dict):
+        raise ConfigError(f"mapping entry is not a mapping: {entry!r}")
+    if "id" not in entry:
+        raise ConfigError(f"mapping missing required field 'id': {entry!r}")
+    mid = entry["id"]
+    if not isinstance(mid, str) or not ID_RE.match(mid):
+        raise ConfigError(
+            f"invalid mapping id {mid!r}: must match {ID_RE.pattern}"
+        )
+    for required in ("source", "destination"):
+        if required not in entry:
+            raise ConfigError(f"mapping {mid!r}: missing required field {required!r}")
+    source = str(entry["source"])
+    destination = str(entry["destination"])
+    _require_safe(source, "source", mid)
+    _require_safe(destination, "destination", mid)
+    schedule = str(entry.get("schedule", "daily"))
+    _require_safe(schedule, "schedule", mid)
+    timeout = str(entry.get("timeout", "6h"))
+    _require_safe(timeout, "timeout", mid)
+
+    retention_raw = entry.get("retention") or {}
+    if not isinstance(retention_raw, dict):
+        raise ConfigError(f"mapping {mid!r}: retention must be a mapping")
+    allowed = {f for f in Retention.__dataclass_fields__}
+    unknown = set(retention_raw) - allowed
+    if unknown:
+        raise ConfigError(
+            f"mapping {mid!r}: unknown retention keys: {sorted(unknown)}"
+        )
+    prune = retention_raw.get("prune", "always")
+    if prune not in ("always", "never"):
+        raise ConfigError(
+            f"mapping {mid!r}: retention.prune must be 'always' or 'never'"
+        )
+    retention = Retention(**retention_raw)
+
+    return Mapping(
+        id=mid,
+        source=Path(source),
+        destination=destination,
+        mode=entry.get("mode", "sync"),
+        trigger=entry.get("trigger", "scheduled"),
+        schedule=schedule,
+        debounce=int(entry.get("debounce", 30)),
+        timeout=timeout,
+        password_file=Path(entry["password_file"]) if entry.get("password_file") else None,
+        retention=retention,
+        rclone_flags=list(entry.get("rclone_flags", []) or []),
+        exclude=list(entry.get("exclude", []) or []),
+    )
+
+
 def load_config(path: Path = CONFIG_PATH) -> tuple[dict, list[Mapping]]:
     if not path.exists():
-        log.error("config not found: %s", path)
-        sys.exit(2)
+        raise ConfigError(f"config not found: {path}")
     with open(path) as f:
         data = yaml.safe_load(f) or {}
+    if not isinstance(data, dict):
+        raise ConfigError(f"config root must be a mapping, got {type(data).__name__}")
 
     defaults = data.get("defaults", {}) or {}
-    default_rclone_flags = defaults.get("rclone_flags", []) or []
-    default_excludes = defaults.get("exclude", []) or []
+    default_rclone_flags = list(defaults.get("rclone_flags", []) or [])
+    default_excludes = list(defaults.get("exclude", []) or [])
 
     mappings: list[Mapping] = []
     for entry in data.get("mappings", []) or []:
-        retention = Retention(**(entry.get("retention") or {}))
-        m = Mapping(
-            id=entry["id"],
-            source=Path(entry["source"]),
-            destination=entry["destination"],
-            mode=entry.get("mode", "sync"),
-            trigger=entry.get("trigger", "scheduled"),
-            schedule=entry.get("schedule", "daily"),
-            debounce=int(entry.get("debounce", 30)),
-            password_file=Path(entry["password_file"]) if entry.get("password_file") else None,
-            retention=retention,
-            rclone_flags=list(default_rclone_flags) + list(entry.get("rclone_flags", []) or []),
-            exclude=list(default_excludes) + list(entry.get("exclude", []) or []),
-        )
+        m = _build_mapping(entry)
+        # Defaults go first so per-mapping flags can override.
+        m.rclone_flags = default_rclone_flags + m.rclone_flags
+        m.exclude = default_excludes + m.exclude
         mappings.append(m)
     return defaults, mappings
+
+
+# ---------- locking ----------
+
+def _acquire_run_lock(mapping_id: str):
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    lock_path = RUNTIME_DIR / f"{mapping_id}.lock"
+    fh = open(lock_path, "w")
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        log.info("another cloudsync run for %s is in progress; exiting", mapping_id)
+        fh.close()
+        return None
+    return fh
 
 
 # ---------- execution ----------
 
 def run_sync(m: Mapping) -> None:
+    # User-supplied flags come last so they override defaults (rclone is last-wins).
     cmd = [
         "rclone", "sync",
         "--config", str(RCLONE_CONFIG),
@@ -128,23 +215,27 @@ def run_backup(m: Mapping) -> None:
 
     repo = f"rclone:{m.destination}"
 
-    # Init repo on first run
+    # Only initialize when restic explicitly reports "repository does not exist"
+    # (exit code 10). Any other failure is a real error we should surface.
     check = subprocess.run(
         ["restic", "-r", repo, "cat", "config"],
         env=env, capture_output=True,
     )
-    if check.returncode != 0:
+    if check.returncode == RESTIC_EXIT_REPO_MISSING:
         log.info("[backup] initializing restic repo at %s", repo)
         subprocess.run(["restic", "-r", repo, "init"], env=env, check=True)
+    elif check.returncode != 0:
+        sys.stderr.write(check.stderr.decode("utf-8", errors="replace"))
+        raise subprocess.CalledProcessError(
+            check.returncode, check.args, check.stdout, check.stderr,
+        )
 
-    # Backup
     cmd = ["restic", "-r", repo, "backup", str(m.source), "--tag", f"cloudsync:{m.id}"]
     for pattern in m.exclude:
         cmd.extend(["--exclude", pattern])
     log.info("[backup] %s -> %s", m.source, repo)
     subprocess.run(cmd, env=env, check=True)
 
-    # Retention
     cmd = [
         "restic", "-r", repo, "forget",
         "--tag", f"cloudsync:{m.id}",
@@ -152,9 +243,12 @@ def run_backup(m: Mapping) -> None:
         "--keep-weekly", str(m.retention.keep_weekly),
         "--keep-monthly", str(m.retention.keep_monthly),
         "--keep-yearly", str(m.retention.keep_yearly),
-        "--prune",
     ]
-    log.info("[backup] applying retention policy")
+    if m.retention.prune == "always":
+        cmd.append("--prune")
+        log.info("[backup] applying retention policy (with prune)")
+    else:
+        log.info("[backup] applying retention policy (forget only, no prune)")
     subprocess.run(cmd, env=env, check=True)
 
 
@@ -167,6 +261,16 @@ def dispatch(m: Mapping) -> None:
         raise ValueError(f"unknown mode: {m.mode}")
 
 
+def _run_locked(m: Mapping) -> None:
+    lock = _acquire_run_lock(m.id)
+    if lock is None:
+        return
+    try:
+        dispatch(m)
+    finally:
+        lock.close()
+
+
 # ---------- subcommands ----------
 
 def cmd_run(args) -> None:
@@ -176,23 +280,26 @@ def cmd_run(args) -> None:
         log.error("unknown mapping id: %s", args.id)
         log.error("available: %s", ", ".join(by_id))
         sys.exit(2)
-    dispatch(by_id[args.id])
+    _run_locked(by_id[args.id])
 
 
 def cmd_run_all(args) -> None:
     _, mappings = load_config()
     failed: list[str] = []
+    succeeded: list[str] = []
     for m in mappings:
         try:
-            dispatch(m)
+            _run_locked(m)
+            succeeded.append(m.id)
         except subprocess.CalledProcessError as e:
             log.error("mapping %s failed: %s", m.id, e)
             failed.append(m.id)
         except Exception as e:
             log.error("mapping %s error: %s", m.id, e)
             failed.append(m.id)
+    print(f"\nrun-all summary: {len(succeeded)} ok, {len(failed)} failed")
     if failed:
-        log.error("failed mappings: %s", ", ".join(failed))
+        print(f"failed: {', '.join(failed)}")
         sys.exit(1)
 
 
@@ -202,15 +309,32 @@ def cmd_list(args) -> None:
         print("(no mappings configured)")
         return
     w_id = max((len(m.id) for m in mappings), default=10)
+    w_id = max(w_id, len("ID"))
     print(f"{'ID'.ljust(w_id)}  MODE    TRIGGER    SOURCE -> DESTINATION")
     print("-" * 80)
     for m in mappings:
         print(f"{m.id.ljust(w_id)}  {m.mode:<6}  {m.trigger:<9}  {m.source} -> {m.destination}")
 
 
+def _validate_schedule(expr: str) -> Optional[str]:
+    """Return None if valid, else an error string. Best-effort using systemd-analyze."""
+    if not shutil.which("systemd-analyze"):
+        return None  # can't validate, don't block
+    res = subprocess.run(
+        ["systemd-analyze", "calendar", expr],
+        capture_output=True, text=True,
+    )
+    if res.returncode != 0:
+        return (res.stderr or res.stdout).strip() or "invalid OnCalendar expression"
+    return None
+
+
 def cmd_check(args) -> None:
     try:
         _, mappings = load_config()
+    except ConfigError as e:
+        log.error("config invalid: %s", e)
+        sys.exit(1)
     except Exception as e:
         log.error("config invalid: %s", e)
         sys.exit(1)
@@ -230,14 +354,26 @@ def cmd_check(args) -> None:
         if m.trigger not in ("realtime", "scheduled", "both"):
             log.error("%s: invalid trigger: %s", m.id, m.trigger)
             ok = False
+        if m.trigger in ("scheduled", "both"):
+            err = _validate_schedule(m.schedule)
+            if err:
+                log.error("%s: invalid schedule %r: %s", m.id, m.schedule, err)
+                ok = False
         if m.mode == "backup":
             if not m.password_file:
                 log.error("%s: backup mode requires password_file", m.id)
                 ok = False
             elif not m.password_file.exists():
                 log.warning("%s: password file missing: %s", m.id, m.password_file)
+            else:
+                mode = m.password_file.stat().st_mode & 0o777
+                if mode & (stat.S_IRWXG | stat.S_IRWXO):
+                    log.error(
+                        "%s: password file %s has insecure mode %04o (should be 0400 or 0600)",
+                        m.id, m.password_file, mode,
+                    )
+                    ok = False
 
-    # Tool availability
     for tool in ("rclone",):
         if not shutil.which(tool):
             log.error("required tool not found in PATH: %s", tool)
@@ -261,6 +397,7 @@ Description=Cloudsync ({mode}) for {id}: {source} -> {destination}
 After=network-online.target
 Wants=network-online.target
 ConditionPathExists={source}
+OnFailure=cloudsync-failure@%n.service
 
 [Service]
 Type=oneshot
@@ -269,7 +406,16 @@ Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=5
 SyslogIdentifier=cloudsync-{id}
-TimeoutStartSec=6h
+TimeoutStartSec={timeout}
+RuntimeDirectory=cloudsync
+RuntimeDirectoryPreserve=yes
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+PrivateTmp=true
+ReadWritePaths=/etc/cloudsync /run/cloudsync /root/.cache/rclone /root/.cache/restic
 """
 
 TIMER_TEMPLATE = """\
@@ -291,13 +437,24 @@ REALTIME_SERVICE_TEMPLATE = """\
 Description=Cloudsync realtime (debounced) run for {id}
 After=network-online.target
 Wants=network-online.target
+ConditionPathExists={source}
+OnFailure=cloudsync-failure@%n.service
 
 [Service]
 Type=oneshot
 Environment=CLOUDSYNC_DEBOUNCE={debounce}
 ExecStart=/usr/local/bin/cloudsync-realtime-tick {id}
 SyslogIdentifier=cloudsync-realtime-{id}
-TimeoutStartSec=6h
+TimeoutStartSec={timeout}
+RuntimeDirectory=cloudsync
+RuntimeDirectoryPreserve=yes
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+PrivateTmp=true
+ReadWritePaths=/etc/cloudsync /run/cloudsync /root/.cache/rclone /root/.cache/restic
 """
 
 REALTIME_PATH_TEMPLATE = """\
@@ -313,19 +470,87 @@ Unit=cloudsync-realtime-{id}.service
 WantedBy=multi-user.target
 """
 
+FAILURE_TEMPLATE_UNIT = """\
+[Unit]
+Description=Cloudsync failure notifier for %i
+# This is a template. Override with `systemctl edit cloudsync-failure@.service`
+# to plug in your notifier of choice (ntfy, healthchecks, email, etc.).
+# Example drop-in (/etc/systemd/system/cloudsync-failure@.service.d/override.conf):
+#   [Service]
+#   ExecStart=
+#   ExecStart=/usr/bin/curl -fsS -m 10 https://hc-ping.com/<uuid>/fail
+
+[Service]
+Type=oneshot
+ExecStart=/bin/true
+"""
+
+
+UNIT_KINDS = {
+    "service":          "cloudsync-{id}.service",
+    "timer":            "cloudsync-{id}.timer",
+    "realtime-service": "cloudsync-realtime-{id}.service",
+    "realtime-path":    "cloudsync-realtime-{id}.path",
+}
+
 
 def systemd_filename(kind: str, mapping_id: str) -> Path:
-    # kind is one of: service, timer, realtime-service, realtime-path
-    return {
-        "service": SYSTEMD_DIR / f"cloudsync-{mapping_id}.service",
-        "timer": SYSTEMD_DIR / f"cloudsync-{mapping_id}.timer",
-        "realtime-service": SYSTEMD_DIR / f"cloudsync-realtime-{mapping_id}.service",
-        "realtime-path": SYSTEMD_DIR / f"cloudsync-realtime-{mapping_id}.path",
-    }[kind]
+    return SYSTEMD_DIR / UNIT_KINDS[kind].format(id=mapping_id)
+
+
+def _existing_cloudsync_units() -> list[Path]:
+    if not SYSTEMD_DIR.exists():
+        return []
+    patterns = (
+        "cloudsync-*.service", "cloudsync-*.timer",
+        "cloudsync-realtime-*.service", "cloudsync-realtime-*.path",
+    )
+    found: set[Path] = set()
+    for pat in patterns:
+        found.update(SYSTEMD_DIR.glob(pat))
+    # Exclude the shared failure template unit — it's not per-mapping.
+    found.discard(SYSTEMD_DIR / "cloudsync-failure@.service")
+    return sorted(found)
+
+
+def _expected_units(mappings: list[Mapping]) -> set[Path]:
+    expected: set[Path] = set()
+    for m in mappings:
+        expected.add(systemd_filename("service", m.id))
+        if m.trigger in ("scheduled", "both"):
+            expected.add(systemd_filename("timer", m.id))
+        if m.trigger in ("realtime", "both"):
+            expected.add(systemd_filename("realtime-service", m.id))
+            expected.add(systemd_filename("realtime-path", m.id))
+    return expected
+
+
+def _unit_name_for_systemctl(path: Path) -> str:
+    return path.name
+
+
+def _disable_and_remove(path: Path, dry_run: bool) -> None:
+    unit = _unit_name_for_systemctl(path)
+    # Only .timer and .path units are enabled; disabling a .service is a no-op but harmless.
+    if dry_run:
+        print(f"  would disable and remove: {unit}")
+        return
+    log.info("disabling %s", unit)
+    subprocess.run(["systemctl", "disable", "--now", unit], check=False)
+    try:
+        path.unlink()
+        log.info("removed %s", path)
+    except FileNotFoundError:
+        pass
 
 
 def cmd_setup_systemd(args) -> None:
-    _, mappings = load_config()
+    try:
+        _, mappings = load_config()
+    except ConfigError as e:
+        log.error("config invalid: %s", e)
+        sys.exit(1)
+
     if os.geteuid() != 0 and not args.dry_run:
         log.error("setup-systemd must be run as root (or pass --dry-run)")
         sys.exit(2)
@@ -337,10 +562,10 @@ def cmd_setup_systemd(args) -> None:
         scheduled = m.trigger in ("scheduled", "both")
         realtime = m.trigger in ("realtime", "both")
 
-        # Main service (used by both scheduled and realtime-tick)
         svc_path = systemd_filename("service", m.id)
         svc_content = SERVICE_TEMPLATE.format(
-            mode=m.mode, id=m.id, source=m.source, destination=m.destination,
+            mode=m.mode, id=m.id, source=m.source,
+            destination=m.destination, timeout=m.timeout,
         )
         _write(svc_path, svc_content, args.dry_run)
         written.append(svc_path)
@@ -354,7 +579,9 @@ def cmd_setup_systemd(args) -> None:
 
         if realtime:
             rsvc_path = systemd_filename("realtime-service", m.id)
-            rsvc_content = REALTIME_SERVICE_TEMPLATE.format(id=m.id, debounce=m.debounce)
+            rsvc_content = REALTIME_SERVICE_TEMPLATE.format(
+                id=m.id, source=m.source, debounce=m.debounce, timeout=m.timeout,
+            )
             _write(rsvc_path, rsvc_content, args.dry_run)
             written.append(rsvc_path)
 
@@ -363,6 +590,26 @@ def cmd_setup_systemd(args) -> None:
             _write(rpath_path, rpath_content, args.dry_run)
             written.append(rpath_path)
             enabled_units.append(f"cloudsync-realtime-{m.id}.path")
+
+    failure_path = SYSTEMD_DIR / "cloudsync-failure@.service"
+    if not failure_path.exists() or args.dry_run:
+        _write(failure_path, FAILURE_TEMPLATE_UNIT, args.dry_run)
+        if not args.dry_run:
+            written.append(failure_path)
+
+    expected = _expected_units(mappings)
+    orphans = [p for p in _existing_cloudsync_units() if p not in expected]
+
+    if orphans:
+        if args.prune:
+            print(f"\nPruning {len(orphans)} orphan unit(s):")
+            for p in orphans:
+                _disable_and_remove(p, args.dry_run)
+        else:
+            print(f"\n{len(orphans)} orphan unit file(s) on disk "
+                  f"(re-run with --prune to remove):")
+            for p in orphans:
+                print(f"  {p}")
 
     print(f"\n{len(written)} unit files {'would be written' if args.dry_run else 'written'}.")
 
@@ -383,7 +630,16 @@ def _write(path: Path, content: str, dry_run: bool) -> None:
     if dry_run:
         print(f"\n--- {path} ---\n{content}", end="")
         return
-    path.write_text(content)
+    # Atomic replace so a crashed write can't leave a partial unit file.
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w", dir=str(path.parent), prefix=f".{path.name}.", delete=False,
+    ) as tmp:
+        tmp.write(content)
+        tmp.flush()
+        os.fsync(tmp.fileno())
+        tmp_path = Path(tmp.name)
+    os.replace(tmp_path, path)
     log.info("wrote %s", path)
 
 
@@ -395,6 +651,7 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(message)s",
     )
     p = argparse.ArgumentParser(prog="cloudsync", description=__doc__.split("\n\n")[0])
+    p.add_argument("--version", action="version", version=f"cloudsync {__version__}")
     sub = p.add_subparsers(dest="command", required=True)
 
     sp = sub.add_parser("run", help="run a single mapping by id")
@@ -412,10 +669,16 @@ def main() -> None:
 
     sp = sub.add_parser("setup-systemd", help="generate and enable systemd units from config")
     sp.add_argument("--dry-run", action="store_true", help="print units without writing")
+    sp.add_argument("--prune", action="store_true",
+                    help="disable and remove orphan units for ids no longer in config")
     sp.set_defaults(func=cmd_setup_systemd)
 
     args = p.parse_args()
-    args.func(args)
+    try:
+        args.func(args)
+    except ConfigError as e:
+        log.error("config error: %s", e)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

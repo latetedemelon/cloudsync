@@ -1,10 +1,13 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # cloudsync-realtime-tick: debounced trigger for realtime cloudsync runs.
 #
 # Called by the cloudsync-realtime-<id>.path systemd unit whenever the
 # watched source directory changes. Uses a flag file + flock so that bursts
 # of changes coalesce into a single sync run, and changes arriving DURING
 # a run trigger one follow-up run afterwards (no lost updates).
+#
+# The systemd unit uses RuntimeDirectory=cloudsync, so /run/cloudsync
+# is guaranteed to exist with the right mode when we start.
 #
 # Usage: cloudsync-realtime-tick <mapping-id>
 
@@ -14,16 +17,17 @@ id="${1:?mapping id required}"
 debounce="${CLOUDSYNC_DEBOUNCE:-30}"
 
 runtime_dir="/run/cloudsync"
-mkdir -p "$runtime_dir"
 flag="$runtime_dir/$id.dirty"
-lock="$runtime_dir/$id.lock"
+lock="$runtime_dir/$id.tick.lock"
 
 # Mark dirty BEFORE trying to acquire the lock, so that a concurrent
 # invocation that already holds the lock will see our mark when it loops.
 touch "$flag"
 
-# Try to acquire the per-mapping lock. If we can't, another runner is
+# Try to acquire the per-mapping tick lock. If we can't, another tick is
 # already processing and will pick up our dirty mark, so we exit cleanly.
+# Note: this is the tick-level lock. The run-level lock (shared with
+# scheduled runs) is acquired inside `cloudsync run`.
 exec 9>"$lock"
 if ! flock -n 9; then
     exit 0

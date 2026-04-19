@@ -2,11 +2,14 @@
 # ==================
 # Every mapping pairs a local source folder with a remote destination and
 # declares:
+#   id        = [a-z0-9][a-z0-9_-]{0,63}   (used in systemd unit names)
 #   mode      = "sync"   -> rclone sync (mirror, deletions propagate)
 #             | "backup" -> restic via rclone (versioned, deduplicated, encrypted)
 #   trigger   = "scheduled" | "realtime" | "both"
 #   schedule  = systemd OnCalendar expression (used if trigger includes scheduled)
 #   debounce  = seconds to wait after a change before syncing (realtime only)
+#   timeout   = systemd TimeoutStartSec value (default: 6h)
+#   retention.prune = "always" (default) | "never"  (backup mode only)
 #
 # Destination syntax is always rclone-style: <remote>:<path>
 # For backup mode, restic sits on top (restic -r rclone:<remote>:<path>).
@@ -41,12 +44,14 @@ mappings:
     mode: backup
     trigger: scheduled
     schedule: "daily"
+    timeout: "12h"  # large photo libraries can take a while on first upload
     password_file: /etc/cloudsync/secrets/photos.pass
     retention:
       keep_daily: 7
       keep_weekly: 4
       keep_monthly: 12
       keep_yearly: 3
+      prune: always   # run `restic forget --prune` on every backup
 
   # --- SYNC, realtime only, to the VPS over SFTP ---
   - id: code
@@ -63,6 +68,8 @@ mappings:
       - ".git/objects/pack/tmp_pack_*"
 
   # --- BACKUP, scheduled weekly Sunday 03:00, to the VPS ---
+  # Prune is disabled here because we back up frequently; run prune weekly
+  # via a separate cron/timer instead.
   - id: homelab-configs
     source: /srv/data/homelab
     destination: vps:/backups/restic/homelab
@@ -74,6 +81,7 @@ mappings:
       keep_weekly: 8
       keep_monthly: 12
       keep_yearly: 5
+      prune: never
 
   # --- SYNC, scheduled every 15 minutes, to multiple destinations ---
   # (For a single source to multiple destinations, declare one mapping per dest.)

@@ -174,39 +174,58 @@ RESTIC_PASSWORD_FILE=/etc/cloudsync/secrets/photos.pass \
 2. `sudo cloudsync check`
 3. `sudo cloudsync setup-systemd` (re-generates all units idempotently)
 
-If you **remove** a mapping, the orphan units stay on disk until you clean
-them up manually:
+If you **remove** a mapping, re-run `setup-systemd --prune` to disable and
+delete the orphan units:
 
 ```bash
-sudo systemctl disable --now cloudsync-<old-id>.timer cloudsync-realtime-<old-id>.path
-sudo rm /etc/systemd/system/cloudsync-<old-id>.* /etc/systemd/system/cloudsync-realtime-<old-id>.*
-sudo systemctl daemon-reload
+sudo cloudsync setup-systemd --dry-run --prune   # preview what would go
+sudo cloudsync setup-systemd --prune             # apply
 ```
 
-## Optional: healthcheck pings
+Without `--prune`, orphan units are only reported, not removed.
 
-To detect silent failures, wrap `ExecStart` in each service with a
-healthcheck ping. The simplest approach is to add a drop-in for the
-generated units:
+## Optional: failure notifications
+
+Every generated unit has `OnFailure=cloudsync-failure@%n.service`.
+`setup-systemd` drops in a no-op `cloudsync-failure@.service` template on
+first run. Override it once to plug in the notifier of your choice (ntfy,
+healthchecks, email, Slack, etc.):
 
 ```bash
-sudo systemctl edit cloudsync-photos.service
+sudo systemctl edit cloudsync-failure@.service
 ```
 
 ```ini
 [Service]
-ExecStartPost=/usr/bin/curl -fsS -m 10 --retry 3 https://hc-ping.com/<uuid>
-ExecStopPost=/bin/sh -c 'if [ "$SERVICE_RESULT" != "success" ]; then curl -fsS -m 10 https://hc-ping.com/<uuid>/fail; fi'
+ExecStart=
+ExecStart=/usr/bin/curl -fsS -m 10 --retry 3 https://hc-ping.com/<uuid>/fail
 ```
+
+The `%i` instance name is the failing unit (e.g. `cloudsync-photos.service`),
+available as `${MONITOR_UNIT}` in the exec environment.
+
+For success pings, use `ExecStartPost=` directly on the per-mapping unit via
+`systemctl edit cloudsync-photos.service`.
 
 ## Gotchas
 
 - **rclone sync is destructive by design** — test with `rclone check` or
   temporarily set `rclone_flags: ["--dry-run"]` on a new mapping first.
-- **Path units watch a single directory non-recursively by default.** For
-  deep trees with writes in subfolders, rely on the scheduled safety net
-  or expand the `[Path]` section with additional `PathModified=` lines.
+- **Realtime watching is NOT recursive.** systemd `.path` units watch the
+  top-level directory only; modifications deep inside subfolders will NOT
+  trigger a realtime sync. For deep trees, set `trigger: both` so the
+  scheduled safety net catches subfolder changes, or add explicit
+  `PathModified=` lines with `systemctl edit cloudsync-realtime-<id>.path`
+  for the subdirs you care about.
 - **OneDrive throttles aggressively** — for large initial uploads, add
   `--tpslimit 10` and `--transfers 2` to `rclone_flags` for that mapping.
 - **Clock skew on the VPS** matters for SFTP-based rclone syncs; keep NTP
   enabled.
+- **Restic pruning is expensive.** By default `cloudsync` runs
+  `restic forget --prune` after every backup. For frequent backups, set
+  `retention.prune: never` on the mapping and schedule a separate weekly
+  `restic -r <repo> prune` job.
+- **Per-mapping run lock.** `cloudsync run <id>` holds
+  `/run/cloudsync/<id>.lock` for the duration of the sync. If a scheduled
+  run fires while a realtime-triggered run is in progress (or vice versa),
+  the second run exits cleanly rather than racing.

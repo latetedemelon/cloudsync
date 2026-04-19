@@ -43,8 +43,11 @@ if ! python3 -c "import yaml" 2>/dev/null; then
 fi
 
 if [ "${#missing[@]}" -gt 0 ]; then
-    echo "    MISSING: ${missing[*]}"
+    echo
+    echo "==> FAILED: required dependencies missing: ${missing[*]}"
     echo "    Install with: apt install ${missing[*]}  (or equivalent)"
+    echo "    Then re-run this installer."
+    exit 1
 fi
 
 cat <<'EOF'
