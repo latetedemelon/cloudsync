@@ -326,6 +326,12 @@ Hooks are complementary to the systemd `OnFailure=` notifier template: use
 hooks when you want per-mapping behavior wired in the config, use
 `OnFailure=` when you want one global notifier across every mapping.
 
+**Security note.** Hook commands are executed through `/bin/sh -c` and
+therefore fully shell-interpreted. `mappings.yaml` is trusted admin input
+(root-owned, mode 0640 by default); do not hand-write hooks from
+untrusted data. If you need strictly-no-shell semantics for a hook, wrap
+the command in a small standalone script and invoke it from the hook.
+
 ## Metrics
 
 `cloudsync metrics` emits Prometheus-format gauges suitable for the

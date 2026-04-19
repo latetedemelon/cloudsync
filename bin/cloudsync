@@ -312,28 +312,41 @@ def _mark_run_failure(mapping_id: str, err: str, attempt: int) -> None:
 
 # ---------- retry loop ----------
 
+def _format_error(e: BaseException) -> str:
+    if isinstance(e, subprocess.CalledProcessError):
+        return f"{type(e).__name__}: command {e.cmd!r} exited {e.returncode}"
+    return f"{type(e).__name__}: {e}"
+
+
 def _retry(m: Mapping, fn) -> None:
     """Run fn() with retry-on-failure using m.retry config.
 
-    Re-raises the last exception if all attempts fail.
+    Catches any ``Exception`` (not just ``subprocess.CalledProcessError``) so
+    deterministic errors like a missing password file are still recorded in
+    the state files and surfaced to ``status`` / ``metrics`` / ``on_failure``
+    hooks. Re-raises the last exception if all attempts fail.
+
+    Backoff indexing: attempt N (1-indexed) uses ``backoff_seconds[N-1]``,
+    clamped to the last element once N exceeds the list length.
     """
     last_exc: Optional[BaseException] = None
     for attempt in range(1, m.retry.max_attempts + 1):
         try:
             fn()
             return
-        except subprocess.CalledProcessError as e:
+        except Exception as e:
             last_exc = e
-            err = f"{e.__class__.__name__}: command {e.cmd!r} exited {e.returncode}"
-            _mark_run_failure(m.id, err, attempt)
+            _mark_run_failure(m.id, _format_error(e), attempt)
             if attempt >= m.retry.max_attempts:
                 break
-            # Pick backoff: index into list, clamp to last value.
             idx = min(attempt - 1, len(m.retry.backoff_seconds) - 1)
             wait = m.retry.backoff_seconds[idx] if m.retry.backoff_seconds else 0
+            returncode = getattr(e, "returncode", None)
             log.warning(
-                "mapping %s: attempt %d/%d failed (exit %d); retrying in %ds",
-                m.id, attempt, m.retry.max_attempts, e.returncode, wait,
+                "mapping %s: attempt %d/%d failed (%s); retrying in %ds",
+                m.id, attempt, m.retry.max_attempts,
+                f"exit {returncode}" if returncode is not None else type(e).__name__,
+                wait,
             )
             if wait > 0:
                 time.sleep(wait)
@@ -390,10 +403,12 @@ def run_backup(m: Mapping) -> None:
             check.returncode, check.args, check.stdout, check.stderr,
         )
 
-    # Clear stale locks (older than ~30 minutes) left behind by a previously
-    # killed or crashed run. Our flock ensures no concurrent cloudsync run is
-    # active for this mapping, so this is safe. restic's own unlock refuses
-    # to remove fresh locks, so a live external restic session is still safe.
+    # Clear stale restic locks left behind by a previously killed or crashed
+    # run. `restic unlock` (without --remove-all) is the safe form: it only
+    # removes stale locks (process is dead AND lock is older than ~30 min);
+    # exclusive locks held by a live restic process are left intact. Our
+    # per-mapping flock already prevents two cloudsync runs racing here, so
+    # this is defensive cleanup for SIGKILL / OOM / host-reboot scenarios.
     log.info("[backup] clearing any stale restic locks")
     subprocess.run(["restic", "-r", repo, "unlock"], env=env, check=False)
 
@@ -467,9 +482,11 @@ def _run_locked(m: Mapping) -> None:
         _run_hooks(m, "pre_run", m.hooks.pre_run, fatal=True)
         try:
             _retry(m, lambda: dispatch(m))
-        except subprocess.CalledProcessError as e:
-            err = f"command {e.cmd!r} exited {e.returncode}"
-            _run_hooks(m, "on_failure", m.hooks.on_failure, fatal=False, error=err)
+        except Exception as e:
+            _run_hooks(
+                m, "on_failure", m.hooks.on_failure, fatal=False,
+                error=_format_error(e),
+            )
             raise
         _mark_run_success(m.id)
         _run_hooks(m, "on_success", m.hooks.on_success, fatal=False)
@@ -484,7 +501,7 @@ def cmd_run(args) -> None:
     by_id = {m.id: m for m in mappings}
     if args.id not in by_id:
         log.error("unknown mapping id: %s", args.id)
-        log.error("available: %s", ", ".join(by_id))
+        log.error("available: %s", ", ".join(sorted(by_id)))
         sys.exit(2)
     _run_locked(by_id[args.id])
 
@@ -674,7 +691,7 @@ def cmd_check_remote(args) -> None:
     if args.id:
         if args.id not in by_id:
             log.error("unknown mapping id: %s", args.id)
-            log.error("available: %s", ", ".join(by_id))
+            log.error("available: %s", ", ".join(sorted(by_id)))
             sys.exit(2)
         targets = [by_id[args.id]]
     else:

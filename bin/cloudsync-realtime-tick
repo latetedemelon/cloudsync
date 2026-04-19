@@ -6,8 +6,10 @@
 # of changes coalesce into a single sync run, and changes arriving DURING
 # a run trigger one follow-up run afterwards (no lost updates).
 #
-# The systemd unit uses RuntimeDirectory=cloudsync, so /run/cloudsync
-# is guaranteed to exist with the right mode when we start.
+# Under systemd the `RuntimeDirectory=cloudsync` directive guarantees
+# /run/cloudsync exists with the right mode before ExecStart. When invoked
+# manually (debugging, first run, ad-hoc testing) that guarantee doesn't
+# hold, so we create the directory defensively.
 #
 # Usage: cloudsync-realtime-tick <mapping-id>
 
@@ -17,6 +19,12 @@ id="${1:?mapping id required}"
 debounce="${CLOUDSYNC_DEBOUNCE:-30}"
 
 runtime_dir="/run/cloudsync"
+if [ ! -d "$runtime_dir" ]; then
+    mkdir -p -m 0755 "$runtime_dir" || {
+        echo "ERROR: could not create $runtime_dir" >&2
+        exit 1
+    }
+fi
 flag="$runtime_dir/$id.dirty"
 lock="$runtime_dir/$id.tick.lock"
 

@@ -273,6 +273,29 @@ class RetryLoopTests(unittest.TestCase):
             cloudsync._retry(self._mapping(max_attempts=1), fn)
         self.assertEqual(attempts["n"], 1)
 
+    def test_retry_catches_non_subprocess_exceptions(self):
+        # Non-CalledProcessError exceptions (e.g. a missing password file
+        # raising FileNotFoundError) must still trip retry bookkeeping so
+        # that `status`, `metrics`, and `on_failure` hooks observe them.
+        import tempfile
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        orig = cloudsync.STATE_DIR
+        cloudsync.STATE_DIR = Path(tmp.name)
+        self.addCleanup(lambda: setattr(cloudsync, "STATE_DIR", orig))
+
+        attempts = {"n": 0}
+        def fn():
+            attempts["n"] += 1
+            raise FileNotFoundError("password file missing")
+        with self.assertRaises(FileNotFoundError):
+            cloudsync._retry(self._mapping(), fn)
+        self.assertEqual(attempts["n"], 3)
+        self.assertEqual(cloudsync._read_state("t", "attempts"), "3")
+        err = cloudsync._read_state("t", "last-error")
+        self.assertIsNotNone(err)
+        self.assertIn("FileNotFoundError", err)
+
 
 class StateTrackingTests(unittest.TestCase):
     def setUp(self):
