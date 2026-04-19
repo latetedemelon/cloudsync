@@ -1,0 +1,75 @@
+#!/bin/bash
+# install.sh — install cloudsync binaries and scaffold /etc/cloudsync
+set -euo pipefail
+
+if [ "$EUID" -ne 0 ]; then
+    echo "ERROR: run as root (sudo $0)"
+    exit 1
+fi
+
+SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+echo "==> Installing binaries to /usr/local/bin"
+install -m 0755 "$SRC_DIR/bin/cloudsync"               /usr/local/bin/cloudsync
+install -m 0755 "$SRC_DIR/bin/cloudsync-realtime-tick" /usr/local/bin/cloudsync-realtime-tick
+
+echo "==> Creating /etc/cloudsync"
+mkdir -p /etc/cloudsync/secrets
+chmod 0750 /etc/cloudsync
+chmod 0700 /etc/cloudsync/secrets
+
+if [ ! -f /etc/cloudsync/mappings.yaml ]; then
+    echo "==> Installing example mappings.yaml"
+    install -m 0640 "$SRC_DIR/examples/mappings.yaml" /etc/cloudsync/mappings.yaml
+    echo "    Edit /etc/cloudsync/mappings.yaml before running setup-systemd."
+else
+    echo "==> /etc/cloudsync/mappings.yaml exists, leaving untouched"
+fi
+
+echo "==> Checking dependencies"
+missing=()
+for tool in rclone python3; do
+    if ! command -v "$tool" >/dev/null; then
+        missing+=("$tool")
+    fi
+done
+# restic is only needed if you use backup mode; warn softly
+if ! command -v restic >/dev/null; then
+    echo "    note: restic not found (required only for 'backup' mode mappings)"
+fi
+# pyyaml
+if ! python3 -c "import yaml" 2>/dev/null; then
+    missing+=("python3-yaml")
+fi
+
+if [ "${#missing[@]}" -gt 0 ]; then
+    echo "    MISSING: ${missing[*]}"
+    echo "    Install with: apt install ${missing[*]}  (or equivalent)"
+fi
+
+cat <<'EOF'
+
+==> Next steps:
+
+  1. Configure rclone remotes (pcloud, onedrive, vps):
+       sudo rclone config --config /etc/cloudsync/rclone.conf
+
+  2. For backup mappings, create password files:
+       openssl rand -base64 32 | sudo tee /etc/cloudsync/secrets/photos.pass
+       sudo chmod 0400 /etc/cloudsync/secrets/photos.pass
+
+  3. Edit mappings:
+       sudo $EDITOR /etc/cloudsync/mappings.yaml
+
+  4. Validate:
+       sudo cloudsync check
+
+  5. Dry-run the systemd generation, then apply:
+       sudo cloudsync setup-systemd --dry-run
+       sudo cloudsync setup-systemd
+
+  6. Inspect:
+       systemctl list-timers 'cloudsync-*'
+       journalctl -u 'cloudsync-*' -f
+
+EOF

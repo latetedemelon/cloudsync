@@ -1,0 +1,39 @@
+#!/bin/bash
+# cloudsync-realtime-tick: debounced trigger for realtime cloudsync runs.
+#
+# Called by the cloudsync-realtime-<id>.path systemd unit whenever the
+# watched source directory changes. Uses a flag file + flock so that bursts
+# of changes coalesce into a single sync run, and changes arriving DURING
+# a run trigger one follow-up run afterwards (no lost updates).
+#
+# Usage: cloudsync-realtime-tick <mapping-id>
+
+set -euo pipefail
+
+id="${1:?mapping id required}"
+debounce="${CLOUDSYNC_DEBOUNCE:-30}"
+
+runtime_dir="/run/cloudsync"
+mkdir -p "$runtime_dir"
+flag="$runtime_dir/$id.dirty"
+lock="$runtime_dir/$id.lock"
+
+# Mark dirty BEFORE trying to acquire the lock, so that a concurrent
+# invocation that already holds the lock will see our mark when it loops.
+touch "$flag"
+
+# Try to acquire the per-mapping lock. If we can't, another runner is
+# already processing and will pick up our dirty mark, so we exit cleanly.
+exec 9>"$lock"
+if ! flock -n 9; then
+    exit 0
+fi
+
+# Debounce window: swallow the initial burst.
+sleep "$debounce"
+
+# Drain: run until no new dirty marks arrive during a run.
+while [ -f "$flag" ]; do
+    rm -f "$flag"
+    /usr/local/bin/cloudsync run "$id"
+done
