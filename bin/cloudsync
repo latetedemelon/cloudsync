@@ -12,6 +12,7 @@ Subcommands:
   check            Validate config and sources
   status           Report last-run / last-success / next-fire for each mapping
   check-remote     Verify remote integrity (restic check / rclone check)
+  metrics          Emit Prometheus-format metrics (textfile collector)
   setup-systemd    Generate per-mapping systemd service/timer/path units
 """
 
@@ -40,7 +41,7 @@ except ImportError:
     sys.exit(1)
 
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 CONFIG_PATH = Path(os.environ.get("CLOUDSYNC_CONFIG", "/etc/cloudsync/mappings.yaml"))
 RCLONE_CONFIG = Path(os.environ.get("RCLONE_CONFIG", "/etc/cloudsync/rclone.conf"))
@@ -78,6 +79,15 @@ class Retry:
 
 
 @dataclass
+class Hooks:
+    # Each entry is a shell command string, run via /bin/sh -c.
+    # pre_run failures abort the run; on_success/on_failure failures log a warning.
+    pre_run: list[str] = field(default_factory=list)
+    on_success: list[str] = field(default_factory=list)
+    on_failure: list[str] = field(default_factory=list)
+
+
+@dataclass
 class Mapping:
     id: str
     source: Path
@@ -90,6 +100,7 @@ class Mapping:
     password_file: Optional[Path] = None
     retention: Retention = field(default_factory=Retention)
     retry: Retry = field(default_factory=Retry)
+    hooks: Hooks = field(default_factory=Hooks)
     rclone_flags: list[str] = field(default_factory=list)
     exclude: list[str] = field(default_factory=list)
 
@@ -162,6 +173,27 @@ def _build_mapping(entry: dict) -> Mapping:
         )
     retry = Retry(max_attempts=max_attempts, backoff_seconds=list(backoff))
 
+    hooks_raw = entry.get("hooks") or {}
+    if not isinstance(hooks_raw, dict):
+        raise ConfigError(f"mapping {mid!r}: hooks must be a mapping")
+    allowed_hooks = {f for f in Hooks.__dataclass_fields__}
+    unknown_hooks = set(hooks_raw) - allowed_hooks
+    if unknown_hooks:
+        raise ConfigError(
+            f"mapping {mid!r}: unknown hooks keys: {sorted(unknown_hooks)}"
+        )
+    hooks_kwargs: dict[str, list[str]] = {}
+    for hook_name in allowed_hooks:
+        raw = hooks_raw.get(hook_name, []) or []
+        if not isinstance(raw, list) or not all(isinstance(x, str) for x in raw):
+            raise ConfigError(
+                f"mapping {mid!r}: hooks.{hook_name} must be a list of strings"
+            )
+        for cmd in raw:
+            _require_safe(cmd, f"hooks.{hook_name}", mid)
+        hooks_kwargs[hook_name] = list(raw)
+    hooks = Hooks(**hooks_kwargs)
+
     return Mapping(
         id=mid,
         source=Path(source),
@@ -174,6 +206,7 @@ def _build_mapping(entry: dict) -> Mapping:
         password_file=Path(entry["password_file"]) if entry.get("password_file") else None,
         retention=retention,
         retry=retry,
+        hooks=hooks,
         rclone_flags=list(entry.get("rclone_flags", []) or []),
         exclude=list(entry.get("exclude", []) or []),
     )
@@ -357,6 +390,13 @@ def run_backup(m: Mapping) -> None:
             check.returncode, check.args, check.stdout, check.stderr,
         )
 
+    # Clear stale locks (older than ~30 minutes) left behind by a previously
+    # killed or crashed run. Our flock ensures no concurrent cloudsync run is
+    # active for this mapping, so this is safe. restic's own unlock refuses
+    # to remove fresh locks, so a live external restic session is still safe.
+    log.info("[backup] clearing any stale restic locks")
+    subprocess.run(["restic", "-r", repo, "unlock"], env=env, check=False)
+
     cmd = ["restic", "-r", repo, "backup", str(m.source), "--tag", f"cloudsync:{m.id}"]
     for pattern in m.exclude:
         cmd.extend(["--exclude", pattern])
@@ -388,14 +428,51 @@ def dispatch(m: Mapping) -> None:
         raise ValueError(f"unknown mode: {m.mode}")
 
 
+def _hook_env(m: Mapping, error: Optional[str] = None) -> dict:
+    env = os.environ.copy()
+    env.update({
+        "CLOUDSYNC_MAPPING_ID": m.id,
+        "CLOUDSYNC_MODE": m.mode,
+        "CLOUDSYNC_SOURCE": str(m.source),
+        "CLOUDSYNC_DESTINATION": m.destination,
+        "CLOUDSYNC_TRIGGER": m.trigger,
+    })
+    if error is not None:
+        env["CLOUDSYNC_ERROR"] = error
+    return env
+
+
+def _run_hooks(m: Mapping, kind: str, commands: list[str], fatal: bool,
+               error: Optional[str] = None) -> None:
+    if not commands:
+        return
+    env = _hook_env(m, error=error)
+    for cmd in commands:
+        log.info("[%s hook] %s: %s", kind, m.id, cmd)
+        try:
+            subprocess.run(["/bin/sh", "-c", cmd], env=env, check=True)
+        except subprocess.CalledProcessError as e:
+            if fatal:
+                log.error("%s hook failed (exit %d); aborting run", kind, e.returncode)
+                raise
+            log.warning("%s hook failed (exit %d); continuing", kind, e.returncode)
+
+
 def _run_locked(m: Mapping) -> None:
     lock = _acquire_run_lock(m.id)
     if lock is None:
         return
     try:
         _mark_run_start(m.id)
-        _retry(m, lambda: dispatch(m))
+        _run_hooks(m, "pre_run", m.hooks.pre_run, fatal=True)
+        try:
+            _retry(m, lambda: dispatch(m))
+        except subprocess.CalledProcessError as e:
+            err = f"command {e.cmd!r} exited {e.returncode}"
+            _run_hooks(m, "on_failure", m.hooks.on_failure, fatal=False, error=err)
+            raise
         _mark_run_success(m.id)
+        _run_hooks(m, "on_success", m.hooks.on_success, fatal=False)
     finally:
         lock.close()
 
@@ -626,6 +703,71 @@ def cmd_check_remote(args) -> None:
     if failed:
         print(f"failed: {', '.join(failed)}")
         sys.exit(1)
+
+
+# ---------- metrics ----------
+
+def _render_metrics(mappings: list[Mapping]) -> str:
+    lines: list[str] = []
+    lines.append("# HELP cloudsync_last_run_timestamp_seconds Unix epoch of last run start; 0 if never")
+    lines.append("# TYPE cloudsync_last_run_timestamp_seconds gauge")
+    for m in mappings:
+        ts = _parse_iso(_read_state(m.id, "last-run"))
+        val = int(ts.timestamp()) if ts else 0
+        lines.append(
+            f'cloudsync_last_run_timestamp_seconds{{id="{m.id}",mode="{m.mode}"}} {val}'
+        )
+    lines.append("# HELP cloudsync_last_success_timestamp_seconds Unix epoch of last successful run; 0 if never")
+    lines.append("# TYPE cloudsync_last_success_timestamp_seconds gauge")
+    for m in mappings:
+        ts = _parse_iso(_read_state(m.id, "last-success"))
+        val = int(ts.timestamp()) if ts else 0
+        lines.append(
+            f'cloudsync_last_success_timestamp_seconds{{id="{m.id}",mode="{m.mode}"}} {val}'
+        )
+    lines.append("# HELP cloudsync_last_failure_timestamp_seconds Unix epoch of last failed run; 0 if never")
+    lines.append("# TYPE cloudsync_last_failure_timestamp_seconds gauge")
+    for m in mappings:
+        raw = _read_state(m.id, "last-error")
+        ts = _parse_iso(raw) if raw else None
+        val = int(ts.timestamp()) if ts else 0
+        lines.append(
+            f'cloudsync_last_failure_timestamp_seconds{{id="{m.id}",mode="{m.mode}"}} {val}'
+        )
+    lines.append("# HELP cloudsync_consecutive_failures Consecutive failed attempts since last success")
+    lines.append("# TYPE cloudsync_consecutive_failures gauge")
+    for m in mappings:
+        raw = _read_state(m.id, "attempts")
+        val = int(raw) if raw and raw.isdigit() else 0
+        lines.append(
+            f'cloudsync_consecutive_failures{{id="{m.id}",mode="{m.mode}"}} {val}'
+        )
+    lines.append("# HELP cloudsync_mapping_info Labels describing each mapping")
+    lines.append("# TYPE cloudsync_mapping_info gauge")
+    for m in mappings:
+        lines.append(
+            f'cloudsync_mapping_info{{id="{m.id}",mode="{m.mode}",'
+            f'trigger="{m.trigger}"}} 1'
+        )
+    return "\n".join(lines) + "\n"
+
+
+def cmd_metrics(args) -> None:
+    _, mappings = load_config()
+    text = _render_metrics(mappings)
+    if args.output:
+        out = Path(args.output)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="w", dir=str(out.parent), prefix=f".{out.name}.", delete=False,
+        ) as tmp:
+            tmp.write(text)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+            tmp_path = Path(tmp.name)
+        os.replace(tmp_path, out)
+    else:
+        sys.stdout.write(text)
 
 
 def _validate_schedule(expr: str) -> Optional[str]:
@@ -989,6 +1131,17 @@ def main() -> None:
     sp.add_argument("id", nargs="?", default=None,
                     help="mapping id to check; omit to check all")
     sp.set_defaults(func=cmd_check_remote)
+
+    sp = sub.add_parser(
+        "metrics",
+        help="emit Prometheus-format metrics (for node_exporter textfile collector)",
+    )
+    sp.add_argument(
+        "--output", "-o", default=None,
+        help="write to this file atomically instead of stdout "
+             "(e.g. /var/lib/node_exporter/textfile/cloudsync.prom)",
+    )
+    sp.set_defaults(func=cmd_metrics)
 
     sp = sub.add_parser("setup-systemd", help="generate and enable systemd units from config")
     sp.add_argument("--dry-run", action="store_true", help="print units without writing")

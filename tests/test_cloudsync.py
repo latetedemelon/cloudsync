@@ -299,6 +299,165 @@ class StateTrackingTests(unittest.TestCase):
         self.assertIsNotNone(cloudsync._read_state("m1", "last-run"))
 
 
+class HooksConfigTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_default_hooks_empty(self):
+        p = _write(self.tmp, """\
+            mappings:
+              - id: docs
+                source: /srv/x
+                destination: r:x
+                mode: sync
+        """)
+        _, mappings = cloudsync.load_config(p)
+        h = mappings[0].hooks
+        self.assertEqual(h.pre_run, [])
+        self.assertEqual(h.on_success, [])
+        self.assertEqual(h.on_failure, [])
+
+    def test_parses_hook_commands(self):
+        p = _write(self.tmp, """\
+            mappings:
+              - id: docs
+                source: /srv/x
+                destination: r:x
+                mode: sync
+                hooks:
+                  pre_run: ["echo start"]
+                  on_success: ["echo ok", "echo done"]
+                  on_failure: ["echo bad"]
+        """)
+        _, mappings = cloudsync.load_config(p)
+        h = mappings[0].hooks
+        self.assertEqual(h.pre_run, ["echo start"])
+        self.assertEqual(h.on_success, ["echo ok", "echo done"])
+        self.assertEqual(h.on_failure, ["echo bad"])
+
+    def test_rejects_unknown_hook_key(self):
+        p = _write(self.tmp, """\
+            mappings:
+              - id: docs
+                source: /srv/x
+                destination: r:x
+                mode: sync
+                hooks:
+                  before_run: ["echo x"]
+        """)
+        with self.assertRaises(cloudsync.ConfigError):
+            cloudsync.load_config(p)
+
+    def test_rejects_non_list_hook(self):
+        p = _write(self.tmp, """\
+            mappings:
+              - id: docs
+                source: /srv/x
+                destination: r:x
+                mode: sync
+                hooks:
+                  pre_run: "echo nope"
+        """)
+        with self.assertRaises(cloudsync.ConfigError):
+            cloudsync.load_config(p)
+
+
+class RunHooksTests(unittest.TestCase):
+    def _mapping(self, hooks):
+        return cloudsync.Mapping(
+            id="t", source=Path("/x"), destination="r:x", mode="sync",
+            hooks=hooks,
+        )
+
+    def test_pre_run_failure_is_fatal(self):
+        m = self._mapping(cloudsync.Hooks(pre_run=["false"]))
+        with self.assertRaises(subprocess.CalledProcessError):
+            cloudsync._run_hooks(m, "pre_run", m.hooks.pre_run, fatal=True)
+
+    def test_on_success_failure_is_non_fatal(self):
+        m = self._mapping(cloudsync.Hooks(on_success=["false"]))
+        # Should not raise.
+        cloudsync._run_hooks(m, "on_success", m.hooks.on_success, fatal=False)
+
+    def test_hook_env_exports_mapping_info(self):
+        m = self._mapping(cloudsync.Hooks())
+        env = cloudsync._hook_env(m, error="boom")
+        self.assertEqual(env["CLOUDSYNC_MAPPING_ID"], "t")
+        self.assertEqual(env["CLOUDSYNC_MODE"], "sync")
+        self.assertEqual(env["CLOUDSYNC_SOURCE"], "/x")
+        self.assertEqual(env["CLOUDSYNC_DESTINATION"], "r:x")
+        self.assertEqual(env["CLOUDSYNC_ERROR"], "boom")
+
+    def test_hook_env_no_error_key_by_default(self):
+        m = self._mapping(cloudsync.Hooks())
+        env = cloudsync._hook_env(m)
+        self.assertNotIn("CLOUDSYNC_ERROR", env)
+
+
+class MetricsTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig_state_dir = cloudsync.STATE_DIR
+        cloudsync.STATE_DIR = Path(self._tmp.name)
+
+    def tearDown(self):
+        cloudsync.STATE_DIR = self._orig_state_dir
+        self._tmp.cleanup()
+
+    def _mapping(self, mid="docs", mode="sync", trigger="scheduled"):
+        return cloudsync.Mapping(
+            id=mid, source=Path("/x"), destination="r:x",
+            mode=mode, trigger=trigger,
+        )
+
+    def test_metrics_has_all_series(self):
+        m = self._mapping()
+        out = cloudsync._render_metrics([m])
+        self.assertIn("cloudsync_last_run_timestamp_seconds", out)
+        self.assertIn("cloudsync_last_success_timestamp_seconds", out)
+        self.assertIn("cloudsync_last_failure_timestamp_seconds", out)
+        self.assertIn("cloudsync_consecutive_failures", out)
+        self.assertIn("cloudsync_mapping_info", out)
+
+    def test_metrics_zero_when_no_state(self):
+        m = self._mapping()
+        out = cloudsync._render_metrics([m])
+        self.assertIn(
+            'cloudsync_last_run_timestamp_seconds{id="docs",mode="sync"} 0',
+            out,
+        )
+        self.assertIn(
+            'cloudsync_consecutive_failures{id="docs",mode="sync"} 0',
+            out,
+        )
+        self.assertIn(
+            'cloudsync_mapping_info{id="docs",mode="sync",trigger="scheduled"} 1',
+            out,
+        )
+
+    def test_metrics_reflects_failure_state(self):
+        m = self._mapping()
+        cloudsync._mark_run_failure("docs", "boom", attempt=2)
+        out = cloudsync._render_metrics([m])
+        self.assertIn(
+            'cloudsync_consecutive_failures{id="docs",mode="sync"} 2',
+            out,
+        )
+        import re as _re
+        m_ts = _re.search(
+            r'cloudsync_last_failure_timestamp_seconds\{id="docs",mode="sync"\} (\d+)',
+            out,
+        )
+        self.assertIsNotNone(m_ts)
+        self.assertGreater(int(m_ts.group(1)), 0)
+
+
 class ExpectedUnitsTests(unittest.TestCase):
     def _make(self, mid, trigger):
         return cloudsync.Mapping(

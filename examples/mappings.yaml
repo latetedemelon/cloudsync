@@ -12,6 +12,13 @@
 #   retention.prune = "always" (default) | "never"  (backup mode only)
 #   retry.max_attempts      = attempts per run (default: 3)
 #   retry.backoff_seconds   = delays between attempts (default: [60, 300, 1800])
+#   hooks.pre_run           = shell commands run before the sync; failure aborts
+#   hooks.on_success        = shell commands run after a successful run
+#   hooks.on_failure        = shell commands run after all retries fail
+#
+# Each hook command is executed via `/bin/sh -c`. These env vars are exported:
+#   CLOUDSYNC_MAPPING_ID, CLOUDSYNC_MODE, CLOUDSYNC_SOURCE,
+#   CLOUDSYNC_DESTINATION, CLOUDSYNC_TRIGGER, and for on_failure: CLOUDSYNC_ERROR
 #
 # Destination syntax is always rclone-style: <remote>:<path>
 # `<remote>` is a name you defined with `rclone config`; the backend can be
@@ -46,6 +53,8 @@ mappings:
       - ".sync-conflict-*"
 
   # --- BACKUP (versioned, encrypted), scheduled daily, to the archive remote ---
+  # Hooks wire in Healthchecks.io for start/success/failure notifications.
+  # Replace <uuid> with your check's UUID, or delete the hooks block.
   - id: photos
     source: /srv/data/photos
     destination: archive:restic/photos
@@ -60,6 +69,13 @@ mappings:
       keep_monthly: 12
       keep_yearly: 3
       prune: always   # run `restic forget --prune` on every backup
+    hooks:
+      pre_run:
+        - "curl -fsS -m 10 https://hc-ping.com/<uuid>/start"
+      on_success:
+        - "curl -fsS -m 10 https://hc-ping.com/<uuid>"
+      on_failure:
+        - "curl -fsS -m 10 --data-urlencode \"$CLOUDSYNC_ERROR\" https://hc-ping.com/<uuid>/fail"
 
   # --- SYNC, realtime only, to an offsite server (e.g. SFTP/WebDAV remote) ---
   # Tighter retry schedule: realtime edits should re-try quickly, and

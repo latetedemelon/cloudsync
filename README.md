@@ -23,6 +23,8 @@ For each folder you define in `mappings.yaml`, `cloudsync`:
   - `trigger: realtime`  — systemd path unit with a debounced runner
   - `trigger: both`      — realtime for responsiveness, scheduled as a safety net
 - Logs to the journal, respects per-mapping retention, and coalesces bursts.
+- Fires per-mapping **hooks** (`pre_run`, `on_success`, `on_failure`) and
+  exports Prometheus **metrics** for dashboards and alerting.
 
 ## Architecture
 
@@ -291,6 +293,79 @@ RESTIC_PASSWORD_FILE=/etc/cloudsync/secrets/<id>.pass \
   restic -r rclone:<remote>:<path> restore latest --target /tmp/restore
 ```
 
+## Hooks
+
+Every mapping can declare shell commands to run at lifecycle points:
+
+```yaml
+- id: photos
+  # ... mode / trigger / source / destination ...
+  hooks:
+    pre_run:
+      - "curl -fsS -m 10 https://hc-ping.com/<uuid>/start"
+    on_success:
+      - "curl -fsS -m 10 https://hc-ping.com/<uuid>"
+    on_failure:
+      - "curl -fsS -m 10 --data-urlencode \"$CLOUDSYNC_ERROR\" https://hc-ping.com/<uuid>/fail"
+```
+
+Each command is executed via `/bin/sh -c`. The following env vars are
+exported: `CLOUDSYNC_MAPPING_ID`, `CLOUDSYNC_MODE`, `CLOUDSYNC_SOURCE`,
+`CLOUDSYNC_DESTINATION`, `CLOUDSYNC_TRIGGER`, plus `CLOUDSYNC_ERROR`
+(on `on_failure` only).
+
+Semantics:
+
+- `pre_run` failures abort the run (nothing downstream executes).
+- `on_success` / `on_failure` failures log a warning and do not affect
+  the run's exit status.
+- `on_failure` runs only after all `retry` attempts have been exhausted,
+  not after each individual failed attempt.
+
+Hooks are complementary to the systemd `OnFailure=` notifier template: use
+hooks when you want per-mapping behavior wired in the config, use
+`OnFailure=` when you want one global notifier across every mapping.
+
+## Metrics
+
+`cloudsync metrics` emits Prometheus-format gauges suitable for the
+[`node_exporter` textfile collector](https://github.com/prometheus/node_exporter#textfile-collector):
+
+```bash
+cloudsync metrics
+# or, atomic write:
+cloudsync metrics -o /var/lib/node_exporter/textfile/cloudsync.prom
+```
+
+Exposed series (labels: `id`, `mode`, plus `trigger` on `_info`):
+
+- `cloudsync_last_run_timestamp_seconds` — Unix epoch of last run start
+- `cloudsync_last_success_timestamp_seconds` — last successful run
+- `cloudsync_last_failure_timestamp_seconds` — last failure
+- `cloudsync_consecutive_failures` — failed attempts since last success
+- `cloudsync_mapping_info` — static info series (always `1`)
+
+Wire it to the textfile collector via a tiny timer:
+
+```ini
+# /etc/systemd/system/cloudsync-metrics.timer
+[Unit]
+Description=Publish cloudsync metrics to node_exporter textfile collector
+[Timer]
+OnCalendar=minutely
+[Install]
+WantedBy=timers.target
+```
+
+```ini
+# /etc/systemd/system/cloudsync-metrics.service
+[Unit]
+Description=Publish cloudsync metrics
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/cloudsync metrics -o /var/lib/node_exporter/textfile/cloudsync.prom
+```
+
 ## Resilience and recovery
 
 **What happens when things break?** cloudsync's recovery model leans on
@@ -405,6 +480,61 @@ available as `${MONITOR_UNIT}` in the exec environment.
 
 For success pings, use `ExecStartPost=` directly on the per-mapping unit via
 `systemctl edit cloudsync-photos.service`.
+
+## Similar projects and where cloudsync fits
+
+The folder-to-cloud problem has good solutions already. The ones worth
+knowing about:
+
+- **[autorestic](https://autorestic.vercel.app/)** — YAML-driven
+  wrapper around restic. Clean config, nice CLI, built-in hooks, shell
+  completions. Backup-only; uses rclone but only as a restic backend.
+- **[resticprofile](https://creativeprojects.github.io/resticprofile/)** —
+  Profile-oriented restic wrapper with rich scheduling (cron or systemd),
+  before/after/success/failure hooks, HTTP webhook hooks, Prometheus
+  metrics export, stale-lock auto-unlock, profile inheritance. The most
+  feature-complete restic runner. Backup-only.
+- **[backrest](https://garethgeorge.github.io/backrest/)** — restic with
+  a web UI for managing repos, plans, and snapshots. Good if you want a
+  browser dashboard instead of YAML. Backup-only.
+- **[borgmatic](https://torsion.org/borgmatic/)** — the canonical
+  BorgBackup wrapper. Ships ~12 notification integrations (Healthchecks,
+  ntfy, Pushover, Cronitor, Uptime Kuma, …), scheduled integrity checks
+  with configurable frequency, pre/post/on-error hooks. Uses Borg as its
+  backend, not rclone — so no S3/GDrive/OneDrive, but excellent
+  append-only SSH-repo workflows.
+- **[rclone](https://rclone.org/) + cron** — the floor. If all you need
+  is `rclone sync` on a schedule to one remote, a 3-line crontab is
+  enough. You lose retention, encryption, state tracking, realtime
+  triggers, status, and metrics, but sometimes that's all you need.
+- **[Syncthing](https://syncthing.net/)** — peer-to-peer continuous
+  file sync between your own devices. Not a backup tool (it propagates
+  deletions), not a cloud-storage tool (no S3/Drive/Dropbox), but
+  excellent at its job. Complementary rather than competing.
+
+**What cloudsync does differently:**
+
+- **Mixed sync + backup in one config.** Most alternatives are one or
+  the other. cloudsync routes `mode: sync` to rclone and `mode: backup`
+  to restic-over-rclone, so `/srv/docs` can mirror to Dropbox while
+  `/srv/photos` versions to B2 from the same `mappings.yaml`.
+- **Realtime + scheduled in one mapping.** `trigger: both` generates a
+  systemd `.path` unit (for responsive mirroring) *and* a `.timer`
+  (safety net for deep-tree changes and outages) backed by a single
+  debouncer with flock + drain-loop semantics. None of the listed
+  alternatives ship first-class realtime triggers.
+- **Per-mapping systemd unit generation.** Each mapping gets its own
+  clearly-named `.service` / `.timer` / `.path` files (not templates),
+  so `systemctl list-timers`, `systemctl status`, and journal filtering
+  "just work" per-mapping.
+- **Intentionally thin.** ~1k LOC of Python + bash, one YAML file, no
+  daemon, no web UI, no database. If it's missing a feature, the
+  alternatives above are probably better for your use case.
+
+**Pick another tool if:** you want a web UI (backrest), you're
+all-in on Borg (borgmatic), you want a full restic profile/hooks/metrics
+ecosystem for a backup-only workload (resticprofile), or you want
+pure peer-to-peer sync without a cloud destination (Syncthing).
 
 ## Gotchas
 
