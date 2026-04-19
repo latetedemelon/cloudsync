@@ -12,7 +12,13 @@
 #   retention.prune = "always" (default) | "never"  (backup mode only)
 #
 # Destination syntax is always rclone-style: <remote>:<path>
+# `<remote>` is a name you defined with `rclone config`; the backend can be
+# anything rclone supports (S3, B2, Google Drive, Dropbox, OneDrive, pCloud,
+# SFTP, WebDAV, SMB, local, …). See https://rclone.org/overview/.
 # For backup mode, restic sits on top (restic -r rclone:<remote>:<path>).
+#
+# The placeholder names below (`primary`, `archive`, `offsite`) are just
+# examples — change them to match the remote names in your rclone.conf.
 
 defaults:
   rclone_flags:
@@ -25,10 +31,10 @@ defaults:
 
 mappings:
 
-  # --- SYNC, realtime + scheduled safety net, to pCloud ---
+  # --- SYNC, realtime + scheduled safety net, to the primary remote ---
   - id: documents
     source: /srv/data/documents
-    destination: pcloud:Backup/documents
+    destination: primary:Backup/documents
     mode: sync
     trigger: both
     schedule: hourly
@@ -37,10 +43,10 @@ mappings:
       - "*.tmp"
       - ".sync-conflict-*"
 
-  # --- BACKUP (versioned, encrypted), scheduled daily, to OneDrive ---
+  # --- BACKUP (versioned, encrypted), scheduled daily, to the archive remote ---
   - id: photos
     source: /srv/data/photos
-    destination: onedrive:restic/photos
+    destination: archive:restic/photos
     mode: backup
     trigger: scheduled
     schedule: "daily"
@@ -53,10 +59,10 @@ mappings:
       keep_yearly: 3
       prune: always   # run `restic forget --prune` on every backup
 
-  # --- SYNC, realtime only, to the VPS over SFTP ---
+  # --- SYNC, realtime only, to an offsite server (e.g. SFTP/WebDAV remote) ---
   - id: code
     source: /home/rob/code
-    destination: vps:/backups/code
+    destination: offsite:/backups/code
     mode: sync
     trigger: realtime
     debounce: 45
@@ -67,12 +73,12 @@ mappings:
       - "target/"
       - ".git/objects/pack/tmp_pack_*"
 
-  # --- BACKUP, scheduled weekly Sunday 03:00, to the VPS ---
+  # --- BACKUP, scheduled weekly Sunday 03:00, to the offsite remote ---
   # Prune is disabled here because we back up frequently; run prune weekly
   # via a separate cron/timer instead.
   - id: homelab-configs
     source: /srv/data/homelab
-    destination: vps:/backups/restic/homelab
+    destination: offsite:/backups/restic/homelab
     mode: backup
     trigger: scheduled
     schedule: "Sun *-*-* 03:00:00"
@@ -83,18 +89,18 @@ mappings:
       keep_yearly: 5
       prune: never
 
-  # --- SYNC, scheduled every 15 minutes, to multiple destinations ---
+  # --- SYNC, scheduled every 15 minutes, fan out to multiple destinations ---
   # (For a single source to multiple destinations, declare one mapping per dest.)
-  - id: finance-to-pcloud
+  - id: finance-to-primary
     source: /srv/data/finance
-    destination: pcloud:Backup/finance
+    destination: primary:Backup/finance
     mode: sync
     trigger: scheduled
     schedule: "*:0/15"
 
-  - id: finance-to-onedrive
+  - id: finance-to-archive
     source: /srv/data/finance
-    destination: onedrive:Backup/finance
+    destination: archive:Backup/finance
     mode: sync
     trigger: scheduled
     schedule: "*:0/15"

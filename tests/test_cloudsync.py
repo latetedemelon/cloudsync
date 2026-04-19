@@ -50,7 +50,7 @@ class LoadConfigTests(unittest.TestCase):
             mappings:
               - id: docs
                 source: /srv/docs
-                destination: pcloud:Backup/docs
+                destination: primary:Backup/docs
                 mode: sync
         """)
         _, mappings = cloudsync.load_config(p)
@@ -69,7 +69,7 @@ class LoadConfigTests(unittest.TestCase):
             mappings:
               - id: docs
                 source: /srv/docs
-                destination: pcloud:docs
+                destination: primary:docs
                 mode: sync
                 rclone_flags: ["--transfers", "2"]
                 exclude: ["*.tmp"]
@@ -145,7 +145,7 @@ class TemplateRenderTests(unittest.TestCase):
     def test_service_template_contains_hardening(self):
         rendered = cloudsync.SERVICE_TEMPLATE.format(
             mode="sync", id="docs",
-            source="/srv/docs", destination="pcloud:docs",
+            source="/srv/docs", destination="primary:docs",
             timeout="6h",
         )
         self.assertIn("NoNewPrivileges=true", rendered)

@@ -54,24 +54,30 @@ cat <<'EOF'
 
 ==> Next steps:
 
-  1. Configure rclone remotes (pcloud, onedrive, vps):
+  1. Configure one or more rclone remotes (S3, B2, GDrive, Dropbox,
+     OneDrive, pCloud, SFTP, WebDAV, ... — any backend rclone supports):
        sudo rclone config --config /etc/cloudsync/rclone.conf
+     See https://rclone.org/docs/#configure for per-backend setup.
 
-  2. For backup mappings, create password files:
-       openssl rand -base64 32 | sudo tee /etc/cloudsync/secrets/photos.pass
-       sudo chmod 0400 /etc/cloudsync/secrets/photos.pass
+  2. Verify each remote reaches its backend:
+       sudo rclone --config /etc/cloudsync/rclone.conf listremotes
+       sudo rclone --config /etc/cloudsync/rclone.conf lsd <remote-name>:
 
-  3. Edit mappings:
+  3. For backup mappings, create password files:
+       openssl rand -base64 32 | sudo tee /etc/cloudsync/secrets/<id>.pass
+       sudo chmod 0400 /etc/cloudsync/secrets/<id>.pass
+
+  4. Edit mappings:
        sudo $EDITOR /etc/cloudsync/mappings.yaml
 
-  4. Validate:
+  5. Validate:
        sudo cloudsync check
 
-  5. Dry-run the systemd generation, then apply:
+  6. Dry-run the systemd generation, then apply:
        sudo cloudsync setup-systemd --dry-run
        sudo cloudsync setup-systemd
 
-  6. Inspect:
+  7. Inspect:
        systemctl list-timers 'cloudsync-*'
        journalctl -u 'cloudsync-*' -f
 
