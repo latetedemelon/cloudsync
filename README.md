@@ -129,12 +129,50 @@ The interactive menu asks for:
      key + secret, pick a region/endpoint.
    - *Server protocols* (SFTP, WebDAV, SMB, FTP): hostname, username,
      and either a password or a key path.
+   - *Local-mounted storage* (NAS over NFS/CIFS, USB disks, second
+     drives, bind mounts): choose storage type `local` and set the
+     root path to wherever the volume is mounted (e.g. `/mnt/nas`).
+     Everything `cloudsync` does works identically whether the remote
+     is halfway around the world or on a disk bolted to the case.
+     (For direct SMB/NFS without a mount, use the `smb` backend
+     instead.)
 
 Backend-specific setup details: https://rclone.org/docs/#configure — pick
 your backend from the sidebar for a step-by-step.
 
 Repeat `n` for every remote you want to use. When done, press `q` to
 quit.
+
+Example `rclone.conf` snippet for a NAS mounted at `/mnt/nas`:
+
+```ini
+[nas]
+type = local
+```
+
+rclone's `local` backend is not rooted — the text after the colon is an
+absolute filesystem path. So mount the NAS (via `/etc/fstab`, autofs,
+SMB, NFS, whatever) at a fixed location, then use it in mappings:
+
+```yaml
+destination: nas:/mnt/nas/backups/media
+```
+
+To get a rooted path so you can write `destination: nas:backups/media`,
+stack an `alias` backend on top:
+
+```ini
+[nas-local]
+type = local
+
+[nas]
+type = alias
+remote = nas-local:/mnt/nas
+```
+
+For `mode: sync` only, you can also skip the remote entirely and put a
+bare path in `destination:` (e.g. `/mnt/nas/backups/media`). `mode:
+backup` needs a named remote because it uses `restic -r rclone:<dest>`.
 
 ### 4. Verify each remote works
 
@@ -293,6 +331,13 @@ For success pings, use `ExecStartPost=` directly on the per-mapping unit via
 - **Object stores charge for egress and listings.** Audit your
   mapping's read pattern (especially `--fast-list` behavior on S3/B2)
   against your provider's pricing before running on a large repo.
+- **Local/NAS mounts can disappear.** If your NAS is on NFS/SMB, a
+  network blip can unmount it and leave the mount point as an empty
+  local directory. The scheduled service's `ConditionPathExists=` only
+  checks the *source*, not the destination — a sync to an unmounted
+  NAS will happily write into the empty mount point. Add
+  `RequiresMountsFor=/mnt/nas` via `systemctl edit cloudsync-<id>.service`
+  for NAS-bound mappings, or use rclone's `:local,nounc:` alias tricks.
 - **Restic pruning is expensive.** By default `cloudsync` runs
   `restic forget --prune` after every backup. For frequent backups, set
   `retention.prune: never` on the mapping and schedule a separate weekly

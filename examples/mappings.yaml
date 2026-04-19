@@ -104,3 +104,24 @@ mappings:
     mode: sync
     trigger: scheduled
     schedule: "*:0/15"
+
+  # --- BACKUP to a locally-mounted NAS (NFS/SMB/autofs at /mnt/nas) ---
+  # rclone.conf:
+  #   [nas]
+  #   type = local
+  # The `local` backend has no root path, so the full mount path goes
+  # after the colon. See the README "Configure your rclone remotes"
+  # section for the `alias` trick if you'd rather use `nas:backups/...`.
+  - id: media-to-nas
+    source: /srv/data/media
+    destination: nas:/mnt/nas/restic/media
+    mode: backup
+    trigger: scheduled
+    schedule: "*-*-* 02:30:00"
+    password_file: /etc/cloudsync/secrets/media.pass
+    retention:
+      keep_daily: 14
+      keep_weekly: 8
+      keep_monthly: 12
+      keep_yearly: 3
+      prune: always
